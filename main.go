@@ -48,7 +48,6 @@ func handleConnection(clientConn net.Conn, state *ProxyState) {
 		log.Printf("Read error: %v", err)
 		return
 	}
-	// log.Println("msg: ", message) // too noisy
 
 	message = strings.TrimSpace(message)
 	messageFields := strings.Fields(message)
@@ -58,20 +57,8 @@ func handleConnection(clientConn net.Conn, state *ProxyState) {
 	method := messageFields[0]
 	url := messageFields[1]
 
-	// log.Println("method: ", method)
-	// log.Println("url: ", url)
-
 	// Determine host for blocking check
-	host := url
-	if strings.Contains(host, "://") {
-		host = host[strings.Index(host, "://")+3:]
-	}
-	if idx := strings.Index(host, "/"); idx != -1 {
-		host = host[:idx]
-	}
-	if idx := strings.Index(host, ":"); idx != -1 {
-		host = host[:idx]
-	}
+	host, _, _ := parseURL(url)
 
 	// Check if blocked
 	if state.IsBlocked(host) {
@@ -130,7 +117,8 @@ func handleHTTPS(clientConn net.Conn, target string) {
 
 func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string) {
 	var headers []string
-	host := ""
+	host, port, path := parseURL(url)
+	host = host + ":" + port
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -138,21 +126,12 @@ func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string) {
 			return
 		}
 		trimmedLine := strings.TrimSpace(line)
-		// Extract host
-		if strings.HasPrefix(strings.ToLower(trimmedLine), "host:") {
-			host = strings.TrimSpace(trimmedLine[5:])
-		}
-
 		headers = append(headers, trimmedLine)
 		log.Println("headers: ", headers)
 		log.Println("host: ", host)
 		if line == "\r\n" {
 			break
 		}
-	}
-
-	if !strings.Contains(host, ":") {
-		host = host + ":80"
 	}
 	
 	// Connect to server
@@ -163,8 +142,7 @@ func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string) {
 	}
 	defer serverConn.Close()
 
-	// Get path from URL
-	path := getPathFromURL(url)
+	
 
 	// Send request line
 	fmt.Fprintf(serverConn, "%s %s HTTP/1.1\r\n", method, path)
@@ -185,14 +163,32 @@ func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string) {
 	io.Copy(clientConn, serverConn)
 }
 
-func getPathFromURL(url string) string {
-	// if url contains http:// or https://, strip it
-	if strings.Contains(url, "http://") || strings.Contains(url, "https://") {
-		url = url[strings.Index(url, "://")+3:]
-	}
-	slashIdx := strings.Index(url, "/")
-    if slashIdx == -1 {
-        return "/"
+
+// parseURL extracts host, port, and path from a URL
+// Examples:
+//   "http://example.com/page"      → host="example.com", port="80", path="/page"
+//   "http://example.com:8080/page" → host="example.com", port="8080", path="/page"
+//   "example.com:443"              → host="example.com", port="443", path=""
+func parseURL(url string) (host, port, path string) {
+    // Strip scheme
+    if idx := strings.Index(url, "://"); idx != -1 {
+        url = url[idx+3:]
     }
-	return url[slashIdx:]
+    
+    // Split host from path
+    path = "/"
+    if idx := strings.Index(url, "/"); idx != -1 {
+        path = url[idx:]
+        url = url[:idx]
+    }
+    
+    // Split host from port
+    port = "80"
+    if idx := strings.Index(url, ":"); idx != -1 {
+        port = url[idx+1:]
+        url = url[:idx]
+    }
+    
+    host = url
+    return
 }
