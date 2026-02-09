@@ -25,16 +25,16 @@
     
     <div class="container">
         <div class="column">
-            <h2>Blocked urls</h2>
+            <h2>Blocked Hosts</h2>
             <form action="/block" method="POST" class="form-group">
-                <input type="text" name="url" placeholder="example.com" required>
+                <input type="text" name="host" placeholder="example.com" required>
                 <button type="submit">Block</button>
             </form>
             
             <table>
                 <thead>
                     <tr>
-                        <th>url</th>
+                        <th>Host</th>
                         <th>Action</th>
                     </tr>
                 </thead>
@@ -44,13 +44,13 @@
                         <td>{{.}}</td>
                         <td>
                             <form action="/unblock" method="POST" style="display:inline;">
-                                <input type="hidden" name="url" value="{{.}}">
+                                <input type="hidden" name="host" value="{{.}}">
                                 <button type="submit">Unblock</button>
                             </form>
                         </td>
                     </tr>
                     {{else}}
-                    <tr><td colspan="2">No blocked urls</td></tr>
+                    <tr><td colspan="2">No blocked hosts</td></tr>
                     {{end}}
                 </tbody>
             </table>

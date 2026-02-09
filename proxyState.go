@@ -3,7 +3,7 @@ package main
 import (
 	"encoding/json"
 	"os"
-	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -19,58 +19,51 @@ type RequestLog struct {
 
 // ProxyState holds the shared state for the proxy
 type ProxyState struct {
-	mu              sync.RWMutex
-	BlockedPatterns []string
-	RequestLogs     []RequestLog
-	LogLimit        int
-	Cache           *Cache
+	mu           sync.RWMutex
+	BlockedHosts map[string]bool
+	RequestLogs  []RequestLog
+	LogLimit     int
+	Cache        *Cache
 }
 
 // NewProxyState creates a new ProxyState
 func NewProxyState() *ProxyState {
 	return &ProxyState{
-		BlockedPatterns: make([]string, 0),
-		RequestLogs:     make([]RequestLog, 0),
-		LogLimit:        100, // Keep last 100 logs
-		Cache:           NewCache(),
+		BlockedHosts: make(map[string]bool),
+		RequestLogs:  make([]RequestLog, 0),
+		LogLimit:     100, // Keep last 100 logs
+		Cache:        NewCache(),
 	}
 }
 
-// Block adds a pattern to the blocked list
-func (s *ProxyState) Block(pattern string) {
+// Block adds a host to the blocked list
+func (s *ProxyState) Block(host string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Check if already exists to avoid duplicates
-	for _, p := range s.BlockedPatterns {
-		if p == pattern {
-			return
-		}
-	}
-	s.BlockedPatterns = append(s.BlockedPatterns, pattern)
+	s.BlockedHosts[strings.ToLower(host)] = true
 }
 
-// Unblock removes a pattern from the blocked list
-func (s *ProxyState) Unblock(pattern string) {
+// Unblock removes a host from the blocked list
+func (s *ProxyState) Unblock(host string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
-	newPatterns := make([]string, 0, len(s.BlockedPatterns))
-	for _, p := range s.BlockedPatterns {
-		if p != pattern {
-			newPatterns = append(newPatterns, p)
-		}
-	}
-	s.BlockedPatterns = newPatterns
+	delete(s.BlockedHosts, strings.ToLower(host))
 }
 
-// IsBlocked checks if a url matches any blocked pattern
-func (s *ProxyState) IsBlocked(url string) bool {
+// IsBlocked checks if a host is in the blocked list
+func (s *ProxyState) IsBlocked(host string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	
-	for _, pattern := range s.BlockedPatterns {
-		matched, _ := filepath.Match(pattern, url)
-		if matched {
+	// Check for exact match or suffix match (e.g., "google.com" blocks "www.google.com")
+	// For simplicity, we'll start with exact match and maybe simple subdomain check
+	// A more robust check would split by dots.
+	host = strings.ToLower(host)
+	if s.BlockedHosts[host] {
+		return true
+	}
+	// Check if parent domains are blocked
+	for blocked := range s.BlockedHosts {
+		if strings.HasSuffix(host, "."+blocked) {
 			return true
 		}
 	}
@@ -116,14 +109,15 @@ func (s *ProxyState) GetLogs() []RequestLog {
 	return logs
 }
 
-// GetBlocked returns a list of blocked patterns
+// GetBlocked returns a list of blocked hosts
 func (s *ProxyState) GetBlocked() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	
-	// Return a copy to be safe
-	blocked := make([]string, len(s.BlockedPatterns))
-	copy(blocked, s.BlockedPatterns)
+
+	blocked := make([]string, 0, len(s.BlockedHosts))
+	for host := range s.BlockedHosts {
+		blocked = append(blocked, host)
+	}
 	return blocked
 }
 
@@ -132,7 +126,7 @@ func (s *ProxyState) SaveBlocked(filename string) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	data, err := json.MarshalIndent(s.BlockedPatterns, "", "  ")
+	data, err := json.MarshalIndent(s.BlockedHosts, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -152,5 +146,5 @@ func (s *ProxyState) LoadBlocked(filename string) error {
 		return err
 	}
 
-	return json.Unmarshal(data, &s.BlockedPatterns)
+	return json.Unmarshal(data, &s.BlockedHosts)
 }
