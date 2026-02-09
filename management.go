@@ -38,35 +38,20 @@ func StartManagementServer(addr string, state *ProxyState) {
 
 	http.HandleFunc("/block", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" {
-			host := r.FormValue("host")
-			host = strings.TrimSpace(host)
-			if host != "" {
-				// Sanitize host: remove scheme, path, port
-				if strings.Contains(host, "://") {
-					host = host[strings.Index(host, "://")+3:]
-				}
-				if idx := strings.Index(host, "/"); idx != -1 {
-					host = host[:idx]
-				}
-				if idx := strings.Index(host, ":"); idx != -1 {
-					host = host[:idx]
-				}
-
-				state.Block(host)
-				// Basic persistence for now - saves on every change
-				state.SaveBlocked("blocked.json")
-			}
+			host := strings.TrimSpace(r.FormValue("host"))
+			host, _, _ = parseURL(host)
+			state.Block(host)
+			state.SaveBlocked("blocked.json")
 		}
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 	})
 
 	http.HandleFunc("/unblock", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" {
-			host := r.FormValue("host")
-			if host != "" {
-				state.Unblock(host)
-				state.SaveBlocked("blocked.json")
-			}
+			host := strings.TrimSpace(r.FormValue("host"))
+			host, _, _ = parseURL(host)
+			state.Unblock(host)
+			state.SaveBlocked("blocked.json")
 		}
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 	})
