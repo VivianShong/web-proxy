@@ -56,13 +56,19 @@ func handleConnection(clientConn net.Conn, state *ProxyState) {
 	}
 	method := messageFields[0]
 	url := messageFields[1]
-
-	// Determine host for blocking check
-	host, _, _ := parseURL(url)
-
+	print("method: ", method)
+	print("url: ", url)
+	
+	// Make the full url
+	fullUrl := url
+	if method == "CONNECT" {
+		host, _, path := parseURL(url)
+		fullUrl = "https://" + host + path
+	}
+	
 	// Check if blocked
-	if state.IsBlocked(host) {
-		handleBlocked(clientConn, reader, state, method, url)
+	if state.IsBlocked(fullUrl) {
+		handleBlocked(clientConn, reader, state, method, fullUrl)
 		return
 	}
 	
@@ -72,7 +78,7 @@ func handleConnection(clientConn net.Conn, state *ProxyState) {
 	state.LogRequest(RequestLog{
 		Time:   time.Now(),
 		Method: method,
-		URL:    url,
+		URL:    fullUrl,
 		Status: "Allowed",
 		SrcIP:  clientConn.RemoteAddr().String(),
 	})
@@ -167,7 +173,7 @@ func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string) {
 		fmt.Fprintf(serverConn, "%s\r\n", header)
 	}
 	fmt.Fprintf(serverConn, "\r\n")
-	log.Printf("  → TUNNEL to %s", host)
+	log.Printf("  → request to %s", host)
 
 	// Forward body (if any) and get response
 	go io.Copy(serverConn, reader)
