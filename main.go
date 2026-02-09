@@ -155,8 +155,6 @@ func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string) {
 	}
 	defer serverConn.Close()
 
-	
-
 	// Send request line
 	fmt.Fprintf(serverConn, "%s %s HTTP/1.1\r\n", method, path)
 

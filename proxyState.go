@@ -70,6 +70,21 @@ func (s *ProxyState) IsBlocked(host string) bool {
 	return false
 }
 
+// AddToCache adds a response to the cache
+func (s *ProxyState) AddToCache(key string, resp CacheEntry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Cache.entries[key] = resp
+}
+
+// GetFromCache retrieves a response from the cache
+func (s *ProxyState) GetFromCache(key string) (CacheEntry, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	entry, exists := s.Cache.entries[key]
+    return entry, exists
+}
+
 // LogRequest adds a request log
 func (s *ProxyState) LogRequest(req RequestLog) {
 	s.mu.Lock()
