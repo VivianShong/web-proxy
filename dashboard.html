@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Proxy Management Console</title>
+    <style>
+        body { font-family: monospace; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+        h1, h2, h3 { color: #333; }
+        .container { display: flex; gap: 2rem; }
+        .column { flex: 1; }
+        table { width: 100%; border-collapse: collapse; margin-bottom: 2rem; }
+        th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #ddd; }
+        th { background: #f4f4f4; }
+        .blocked { color: red; }
+        .allowed { color: green; }
+        .form-group { margin-bottom: 1rem; }
+        input[type="text"] { padding: 0.5rem; width: 70%; }
+        button { padding: 0.5rem 1rem; cursor: pointer; }
+        .log-entry { font-size: 0.9rem; }
+    </style>
+</head>
+<body>
+    <h1>Proxy Management Console</h1>
+    
+    <div class="container">
+        <div class="column">
+            <h2>Blocked Hosts</h2>
+            <form action="/block" method="POST" class="form-group">
+                <input type="text" name="host" placeholder="example.com" required>
+                <button type="submit">Block</button>
+            </form>
+            
+            <table>
+                <thead>
+                    <tr>
+                        <th>Host</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {{range .Blocked}}
+                    <tr>
+                        <td>{{.}}</td>
+                        <td>
+                            <form action="/unblock" method="POST" style="display:inline;">
+                                <input type="hidden" name="host" value="{{.}}">
+                                <button type="submit">Unblock</button>
+                            </form>
+                        </td>
+                    </tr>
+                    {{else}}
+                    <tr><td colspan="2">No blocked hosts</td></tr>
+                    {{end}}
+                </tbody>
+            </table>
+        </div>
+        
+        <div class="column">
+            <h2>Recent Requests</h2>
+            <p><a href="/">Refresh</a></p>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Method</th>
+                        <th>URL</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {{range .Logs}}
+                    <tr class="log-entry">
+                        <td>{{.Time.Format "15:04:05"}}</td>
+                        <td>{{.Method}}</td>
+                        <td title="{{.URL}}">{{truncate .URL 40}}</td>
+                        <td class="{{if eq .Status "Blocked"}}blocked{{else}}allowed{{end}}">{{.Status}}</td>
+                    </tr>
+                    {{else}}
+                    <tr><td colspan="4">No requests yet</td></tr>
+                    {{end}}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</body>
+</html>
