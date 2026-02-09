@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"log"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -24,6 +26,7 @@ type ProxyState struct {
 	RequestLogs  []RequestLog
 	LogLimit     int
 	Cache        *Cache
+	activeConns  map[string]map[net.Conn]struct{}
 }
 
 // NewProxyState creates a new ProxyState
@@ -33,7 +36,28 @@ func NewProxyState() *ProxyState {
 		RequestLogs:  make([]RequestLog, 0),
 		LogLimit:     100, // Keep last 100 logs
 		Cache:        NewCache(),
+		activeConns:  make(map[string]map[net.Conn]struct{}),
 	}
+}
+
+func (s *ProxyState) RegisterConn(domain string, conn net.Conn) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    if s.activeConns[domain] == nil {
+        s.activeConns[domain] = make(map[net.Conn]struct{})
+    }
+    s.activeConns[domain][conn] = struct{}{}
+}
+
+func (s *ProxyState) UnregisterConn(domain string, conn net.Conn) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    if set, ok := s.activeConns[domain]; ok {
+        delete(set, conn)
+        if len(set) == 0 {
+            delete(s.activeConns, domain)
+        }
+    }
 }
 
 // Block adds a host to the blocked list
@@ -41,6 +65,14 @@ func (s *ProxyState) Block(host string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.BlockedHosts[strings.ToLower(host)] = true
+	// KILL existing connections to this domain
+    if conns, ok := s.activeConns[host]; ok {
+        log.Printf("Killing %d active connections to %s", len(conns), host)
+        for conn := range conns {
+            conn.Close() // This breaks the io.Copy loop immediately
+        }
+        delete(s.activeConns, host)
+    }
 }
 
 // Unblock removes a host from the blocked list

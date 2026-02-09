@@ -78,7 +78,7 @@ func handleConnection(clientConn net.Conn, state *ProxyState) {
 	})
 
 	if method == "CONNECT" {
-		handleHTTPS(clientConn, url)
+		handleHTTPS(clientConn, url, state)
 	} else {
 		handleHTTP(clientConn, reader, method, url)
 	}
@@ -108,7 +108,7 @@ func cleanConnection(reader *bufio.Reader) {
 	}
 }
 
-func handleHTTPS(clientConn net.Conn, target string) {
+func handleHTTPS(clientConn net.Conn, target string, state *ProxyState) {
 	// Connect to target server
 	serverConn, err := net.Dial("tcp", target)
 	if err != nil {
@@ -122,6 +122,10 @@ func handleHTTPS(clientConn net.Conn, target string) {
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
 	log.Printf("  → TUNNEL to %s", target)
+
+	domain, _, _ := net.SplitHostPort(target)
+    state.RegisterConn(domain, clientConn)
+    defer state.UnregisterConn(domain, clientConn)
 
 	// Copy bytes both directions
 	go io.Copy(serverConn, clientConn)
@@ -167,8 +171,10 @@ func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string) {
 		fmt.Fprintf(serverConn, "%s\r\n", header)
 	}
 	fmt.Fprintf(serverConn, "\r\n")
-	log.Printf("  → TUNNEL to %s", host)
-
+	log.Printf("  → request to %s", host)
+	// Force close connection after response
+	fmt.Fprintf(serverConn, "Connection: close\r\n") 
+    fmt.Fprintf(serverConn, "\r\n")
 	// Forward body (if any) and get response
 	go io.Copy(serverConn, reader)
 	io.Copy(clientConn, serverConn)
