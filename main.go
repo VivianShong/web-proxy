@@ -62,15 +62,7 @@ func handleConnection(clientConn net.Conn, state *ProxyState) {
 
 	// Check if blocked
 	if state.IsBlocked(host) {
-		log.Printf("BLOCKED: %s", host)
-		state.LogRequest(RequestLog{
-			Time:   time.Now(),
-			Method: method,
-			URL:    url,
-			Status: "Blocked",
-			SrcIP:  clientConn.RemoteAddr().String(),
-		})
-		clientConn.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n<h3>Access Denied</h3>"))
+		handleBlocked(clientConn, reader, state, method, url)
 		return
 	}
 	
@@ -86,12 +78,33 @@ func handleConnection(clientConn net.Conn, state *ProxyState) {
 	})
 
 	if method == "CONNECT" {
-		// CONNECT method (HTTPS)
 		handleHTTPS(clientConn, url)
-
 	} else {
-		// other methods (HTTP)
 		handleHTTP(clientConn, reader, method, url)
+	}
+}
+
+func handleBlocked(clientConn net.Conn, reader *bufio.Reader, state *ProxyState, method, url string) {
+    // Consume remaining headers so connection is clean
+    cleanConnection(reader)
+    
+    log.Printf("BLOCKED: %s", url)
+    state.LogRequest(RequestLog{
+        Time:   time.Now(),
+        Method: method,
+        URL:    url,
+        Status: "Blocked",
+        SrcIP:  clientConn.RemoteAddr().String(),
+    })
+    clientConn.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n<h1>Access Denied</h1>"))
+}
+
+func cleanConnection(reader *bufio.Reader) {
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil || strings.TrimSpace(line) == "" {
+			break
+		}
 	}
 }
 
