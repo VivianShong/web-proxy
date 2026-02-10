@@ -3,13 +3,11 @@ package main
 import (
 	"net/http"
 	"sync"
-	"time"
 )
 
 type CacheEntry struct {
-	Body      []byte
-	Header    http.Header
-	ExpiresAt time.Time
+	Body   []byte
+	Header http.Header
 }
 
 type Cache struct {
