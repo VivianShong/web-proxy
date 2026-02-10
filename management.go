@@ -8,8 +8,9 @@ import (
 )
 
 type PageData struct {
-	Blocked []string
-	Logs    []RequestLog
+	Blocked    []string
+	CachedKeys []string
+	Logs       []RequestLog
 }
 
 // truncate is a helper function for the template
@@ -27,8 +28,9 @@ func StartManagementServer(addr string, state *ProxyState) {
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		data := PageData{
-			Blocked: state.GetBlocked(),
-			Logs:    state.GetLogs(),
+			Blocked:    state.GetBlocked(),
+			CachedKeys: state.GetCacheKeys(),
+			Logs:       state.GetLogs(),
 		}
 		if err := tmpl.Execute(w, data); err != nil {
 			log.Printf("Template error: %v", err)

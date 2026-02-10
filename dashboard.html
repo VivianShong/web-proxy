@@ -13,7 +13,9 @@
         th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #ddd; }
         th { background: #f4f4f4; }
         .blocked { color: red; }
+        .blocked { color: red; }
         .allowed { color: green; }
+        .cached { color: blue; }
         .form-group { margin-bottom: 1rem; }
         input[type="text"] { padding: 0.5rem; width: 70%; }
         button { padding: 0.5rem 1rem; cursor: pointer; }
@@ -55,6 +57,26 @@
                 </tbody>
             </table>
         </div>
+
+        <div class="column">
+            <h2>Cached URLs</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>URL</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {{range .CachedKeys}}
+                    <tr>
+                        <td title="{{.}}">{{truncate . 40}}</td>
+                    </tr>
+                    {{else}}
+                    <tr><td>No cached items</td></tr>
+                    {{end}}
+                </tbody>
+            </table>
+        </div>
         
         <div class="column">
             <h2>Recent Requests</h2>
@@ -74,7 +96,8 @@
                         <td>{{.Time.Format "15:04:05"}}</td>
                         <td>{{.Method}}</td>
                         <td title="{{.URL}}">{{truncate .URL 40}}</td>
-                        <td class="{{if eq .Status "Blocked"}}blocked{{else}}allowed{{end}}">{{.Status}}</td>
+                        <td class="{{if eq .Status "Blocked"}}blocked{{else if eq .Status "Cached"}}cached{{else}}allowed{{end}}">{{.Status}}</td>
+
                     </tr>
                     {{else}}
                     <tr><td colspan="4">No requests yet</td></tr>

@@ -180,3 +180,15 @@ func (s *ProxyState) LoadBlocked(filename string) error {
 
 	return json.Unmarshal(data, &s.BlockedHosts)
 }
+
+// GetCacheKeys returns a list of keys currently in the cache
+func (s *ProxyState) GetCacheKeys() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	keys := make([]string, 0, len(s.Cache.entries))
+	for key := range s.Cache.entries {
+		keys = append(keys, key)
+	}
+	return keys
+}

@@ -68,13 +68,7 @@ func handleConnection(clientConn net.Conn, state *ProxyState) {
 		return
 	}
 	
-	state.LogRequest(RequestLog{
-		Time:   time.Now(),
-		Method: method,
-		URL:    url,
-		Status: "Allowed",
-		SrcIP:  clientConn.RemoteAddr().String(),
-	})
+
 
 	if method == "CONNECT" {
 		handleHTTPS(clientConn, url, state)
@@ -108,6 +102,14 @@ func cleanConnection(reader *bufio.Reader) {
 }
 
 func handleHTTPS(clientConn net.Conn, target string, state *ProxyState) {
+	state.LogRequest(RequestLog{
+		Time:   time.Now(),
+		Method: "CONNECT",
+		URL:    target,
+		Status: "Allowed",
+		SrcIP:  clientConn.RemoteAddr().String(),
+	})
+
 	// Connect to target server
 	serverConn, err := net.Dial("tcp", target)
 	if err != nil {
@@ -155,10 +157,25 @@ func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string, s
 		statusCode, _, _ := readResponseStatus(serverConn)
 		if statusCode == 304 {
 			log.Printf("CACHE HIT: %s", url)
+			state.LogRequest(RequestLog{
+				Time:   time.Now(),
+				Method: method,
+				URL:    url,
+				Status: "Cached",
+				SrcIP:  clientConn.RemoteAddr().String(),
+			})
 			sendCachedResponse(clientConn, entry)
 			return
 		}
 	}
+
+	state.LogRequest(RequestLog{
+		Time:   time.Now(),
+		Method: method,
+		URL:    url,
+		Status: "Allowed",
+		SrcIP:  clientConn.RemoteAddr().String(),
+	})
 
 	for {
 		line, err := reader.ReadString('\n')
