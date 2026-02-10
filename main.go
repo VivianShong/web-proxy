@@ -186,26 +186,44 @@ func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string) {
 //   "http://example.com/page"      → host="example.com", port="80", path="/page"
 //   "http://example.com:8080/page" → host="example.com", port="8080", path="/page"
 //   "example.com:443"              → host="example.com", port="443", path=""
+//   "https://example.com/page"     → host="example.com", port="443", path="/page"
 func parseURL(url string) (host, port, path string) {
-    // Strip scheme
-    if idx := strings.Index(url, "://"); idx != -1 {
-        url = url[idx+3:]
-    }
-    
-    // Split host from path
-    path = "/"
-    if idx := strings.Index(url, "/"); idx != -1 {
-        path = url[idx:]
-        url = url[:idx]
-    }
-    
-    // Split host from port
-    port = "80"
-    if idx := strings.Index(url, ":"); idx != -1 {
-        port = url[idx+1:]
-        url = url[:idx]
-    }
-    
-    host = url
-    return
+	
+	// 1. Handle Scheme and Defaults
+	if strings.HasPrefix(url, "http://") {
+		port = "80"
+		url = url[7:] // Strip "http://"
+	} else if strings.HasPrefix(url, "https://") {
+		port = "443"
+		url = url[8:] // Strip "https://"
+	} else {
+		// Case: "example.com:443" (CONNECT method)
+		port = "443"
+	}
+
+	// 2. Separate Path
+	// If a slash exists, split it. This handles full URLs that were stripped above.
+	path = "/"
+	if idx := strings.Index(url, "/"); idx != -1 {
+		path = url[idx:]
+		url = url[:idx]
+	}
+
+	// 3. Strip Authentication (user:pass@host)
+	if idx := strings.LastIndex(url, "@"); idx != -1 {
+		url = url[idx+1:]
+	}
+
+	// 4. Separate Host and Port (IPv6 Safe)
+	colonIdx := strings.LastIndex(url, ":")
+	bracketIdx := strings.LastIndex(url, "]")
+
+	if colonIdx != -1 && colonIdx > bracketIdx {
+		host = url[:colonIdx]
+		port = url[colonIdx+1:]
+	} else {
+		host = url
+	}
+
+	return
 }
