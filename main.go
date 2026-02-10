@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -208,8 +209,9 @@ func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string, s
 	fmt.Fprintf(serverConn, "Connection: close\r\n") 
     fmt.Fprintf(serverConn, "\r\n")
 	// Forward body (if any) and get response
+	// Forward body (if any) and get response
 	go io.Copy(serverConn, reader)
-	io.Copy(clientConn, serverConn)
+	
 	// Cache response
 	streamAndCacheResponse(clientConn, serverConn, url, state)
 	
@@ -227,7 +229,8 @@ func streamAndCacheResponse(clientConn net.Conn, serverConn net.Conn, url string
         return
     }
     // Read, Forward, and Parse Headers
-    headers := make(map[string][]string)
+    // Read, Forward, and Parse Headers
+    headers := make(http.Header)
     for {
         line, err := reader.ReadString('\n')
         if err != nil {
@@ -243,7 +246,7 @@ func streamAndCacheResponse(clientConn net.Conn, serverConn net.Conn, url string
         if len(parts) == 2 {
             key := strings.TrimSpace(parts[0])
             val := strings.TrimSpace(parts[1])
-            headers[key] = append(headers[key], val)
+            headers.Add(key, val)
         }
     }
 
