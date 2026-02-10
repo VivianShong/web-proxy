@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -66,9 +68,6 @@ func handleConnection(clientConn net.Conn, state *ProxyState) {
 		return
 	}
 	
-	// Check if in cache
-	// TODO: implement cache
-	
 	state.LogRequest(RequestLog{
 		Time:   time.Now(),
 		Method: method,
@@ -80,7 +79,7 @@ func handleConnection(clientConn net.Conn, state *ProxyState) {
 	if method == "CONNECT" {
 		handleHTTPS(clientConn, url, state)
 	} else {
-		handleHTTP(clientConn, reader, method, url)
+		handleHTTP(clientConn, reader, method, url, state)
 	}
 }
 
@@ -132,10 +131,34 @@ func handleHTTPS(clientConn net.Conn, target string, state *ProxyState) {
 	io.Copy(clientConn, serverConn)
 }
 
-func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string) {
+func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string, state *ProxyState) {
 	var headers []string
 	host, port, path := parseURL(url)
 	host = host + ":" + port
+
+	// Connect to server
+	serverConn, err := net.Dial("tcp", host)
+	if err != nil {
+		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		return
+	}
+	defer serverConn.Close()
+
+	// Check cache first
+	cacheKey := url
+	if entry, found := state.GetFromCache(cacheKey); found {
+		log.Printf("CACHE HIT: %s", url)
+		if lastMod := entry.Header.Get("Last-Modified"); lastMod != "" {
+			fmt.Fprintf(serverConn, "If-Modified-Since: %s\r\n", lastMod)
+		}
+		// if server returns 304, return cached response
+		statusCode, _, _ := readResponseStatus(serverConn)
+		if statusCode == 304 {
+			log.Printf("CACHE HIT: %s", url)
+			sendCachedResponse(clientConn, entry)
+			return
+		}
+	}
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -150,14 +173,6 @@ func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string) {
 			break
 		}
 	}
-	
-	// Connect to server
-	serverConn, err := net.Dial("tcp", host)
-	if err != nil {
-		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-		return
-	}
-	defer serverConn.Close()
 
 	// Send request line
 	fmt.Fprintf(serverConn, "%s %s HTTP/1.1\r\n", method, path)
@@ -178,8 +193,85 @@ func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string) {
 	// Forward body (if any) and get response
 	go io.Copy(serverConn, reader)
 	io.Copy(clientConn, serverConn)
+	// Cache response
+	streamAndCacheResponse(clientConn, serverConn, url, state)
+	
 }
 
+func streamAndCacheResponse(clientConn net.Conn, serverConn net.Conn, url string, state *ProxyState) {
+    // Use a buffered reader to handle line-by-line reading
+    reader := bufio.NewReader(serverConn)
+    // Read and Forward Status Line
+    statusLine, err := reader.ReadString('\n')
+    if err != nil {
+        return
+    }
+    if _, err := clientConn.Write([]byte(statusLine)); err != nil {
+        return
+    }
+    // Read, Forward, and Parse Headers
+    headers := make(map[string][]string)
+    for {
+        line, err := reader.ReadString('\n')
+        if err != nil {
+            return
+        }
+        if _, err := clientConn.Write([]byte(line)); err != nil {
+            return
+        }
+        if strings.TrimSpace(line) == "" {
+            break
+        }
+        parts := strings.SplitN(line, ":", 2)
+        if len(parts) == 2 {
+            key := strings.TrimSpace(parts[0])
+            val := strings.TrimSpace(parts[1])
+            headers[key] = append(headers[key], val)
+        }
+    }
+
+    // TeeReader duplicates the stream: 
+    // - Reads from 'reader' (server)
+    // - Writes to 'bodyBuf' (cache)
+    // - Returns data to io.Copy for 'clientConn' (user)
+    var bodyBuf bytes.Buffer
+    io.Copy(clientConn, io.TeeReader(reader, &bodyBuf))
+
+    state.AddToCache(url, CacheEntry{
+        Header: headers,
+        Body:   bodyBuf.Bytes(),
+    })
+}
+
+// readResponse reads the response from the server and returns it
+func readResponseStatus(serverConn net.Conn) (statusCode int, statusLine string, reader *bufio.Reader) {
+    reader = bufio.NewReader(serverConn)
+    // Read status line: "HTTP/1.1 200 OK" or "HTTP/1.1 304 Not Modified"
+    statusLine, err := reader.ReadString('\n')
+    if err != nil {
+        return 0, "", reader
+    }
+    // Parse status code
+    parts := strings.Fields(statusLine)
+    if len(parts) >= 2 {
+        statusCode, _ = strconv.Atoi(parts[1])
+    }
+    return statusCode, statusLine, reader
+}
+
+func sendCachedResponse(clientConn net.Conn, entry CacheEntry) {
+    // Send status line
+    clientConn.Write([]byte("HTTP/1.1 200 OK\r\n"))
+    // Send headers
+    for key, values := range entry.Header {
+        for _, value := range values {
+            fmt.Fprintf(clientConn, "%s: %s\r\n", key, value)
+        }
+    }
+    clientConn.Write([]byte("\r\n"))
+	// Send body
+    clientConn.Write(entry.Body)
+}
 
 // parseURL extracts host, port, and path from a URL
 // Examples:
@@ -200,7 +292,6 @@ func parseURL(url string) (host, port, path string) {
 		// Case: "example.com:443" (CONNECT method)
 		port = "443"
 	}
-
 	// 2. Separate Path
 	// If a slash exists, split it. This handles full URLs that were stripped above.
 	path = "/"
@@ -208,12 +299,10 @@ func parseURL(url string) (host, port, path string) {
 		path = url[idx:]
 		url = url[:idx]
 	}
-
 	// 3. Strip Authentication (user:pass@host)
 	if idx := strings.LastIndex(url, "@"); idx != -1 {
 		url = url[idx+1:]
 	}
-
 	// 4. Separate Host and Port (IPv6 Safe)
 	colonIdx := strings.LastIndex(url, ":")
 	bracketIdx := strings.LastIndex(url, "]")
