@@ -13,9 +13,11 @@ import (
 	"time"
 )
 
+var state *ProxyState
+
 func main() {
 	// Initialize shared state
-	state := NewProxyState()
+	state = NewProxyState()
 	if err := state.LoadBlocked("blocked.json"); err != nil {
 		log.Println("No blocked list found, starting fresh.")
 	}
@@ -37,11 +39,11 @@ func main() {
 			log.Println("Error accepting conn:", err)
 			continue
 		}
-		go handleConnection(conn, state)
+		go handleConnection(conn)
 	}
 }
 
-func handleConnection(clientConn net.Conn, state *ProxyState) {
+func handleConnection(clientConn net.Conn) {
 
 	defer clientConn.Close()
 
@@ -65,20 +67,20 @@ func handleConnection(clientConn net.Conn, state *ProxyState) {
 
 	// Check if blocked
 	if state.IsBlocked(host) {
-		logRequest(state, method, url, "Blocked", clientConn)
+		logRequest(method, url, "Blocked", clientConn)
 		clientConn.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n<h1>Access Denied</h1>"))
 		return
 	}
 
 	if method == "CONNECT" {
-		handleHTTPS(clientConn, url, state)
+		handleHTTPS(clientConn, url)
 	} else {
-		handleHTTP(clientConn, reader, method, url, state)
+		handleHTTP(clientConn, reader, method, url)
 	}
 }
 
-func handleHTTPS(clientConn net.Conn, target string, state *ProxyState) {
-	logRequest(state, "CONNECT", target, "Allowed", clientConn)
+func handleHTTPS(clientConn net.Conn, target string) {
+	logRequest("CONNECT", target, "Allowed", clientConn)
 
 	// Connect to target server
 	serverConn, err := net.Dial("tcp", target)
@@ -103,7 +105,7 @@ func handleHTTPS(clientConn net.Conn, target string, state *ProxyState) {
 	io.Copy(clientConn, serverConn)
 }
 
-func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string, state *ProxyState) {
+func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string) {
 	host, port, path := parseURL(url)
 	address := host + ":" + port
 
@@ -137,12 +139,12 @@ func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string, s
 	// Handle response
 	if hasCache && statusCode == 304 {
 		log.Printf("CACHE HIT: %s", url)
-		logRequest(state, method, url, "Cached", clientConn)
+		logRequest(method, url, "Cached", clientConn)
 		sendCachedResponse(clientConn, cachedEntry)
 		return
 	}
-	logRequest(state, method, url, "Allowed", clientConn)
-	streamAndCacheResponse(clientConn, serverReader, statusLine, url, state)
+	logRequest(method, url, "Allowed", clientConn)
+	streamAndCacheResponse(clientConn, serverReader, statusLine, url)
 }
 
 // readClientHeaders reads all headers until empty line
@@ -223,7 +225,7 @@ func readResponseStatus(reader *bufio.Reader) (int, string) {
 }
 
 // logRequest logs request to state
-func logRequest(state *ProxyState, method, url, status string, clientConn net.Conn) {
+func logRequest(method, url, status string, clientConn net.Conn) {
 	state.LogRequest(RequestLog{
 		Time:   time.Now(),
 		Method: method,
@@ -233,7 +235,7 @@ func logRequest(state *ProxyState, method, url, status string, clientConn net.Co
 	})
 }
 
-func streamAndCacheResponse(clientConn net.Conn, reader *bufio.Reader, statusLine, url string, state *ProxyState) {
+func streamAndCacheResponse(clientConn net.Conn, reader *bufio.Reader, statusLine, url string) {
 	if _, err := clientConn.Write([]byte(statusLine)); err != nil {
 		return
 	}
