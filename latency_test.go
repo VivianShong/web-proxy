@@ -433,6 +433,118 @@ func TestCachedResponseBodyMatchesOriginal(t *testing.T) {
 	}
 }
 
+// proxyRequestTimed sends one GET through the proxy and returns elapsed time.
+func proxyRequestTimed(t *testing.T, proxyAddr, targetURL string) time.Duration {
+	t.Helper()
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+	host, _, _ := parseURL(targetURL)
+	start := time.Now()
+	fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
+		targetURL, host)
+	io.Copy(io.Discard, conn)
+	return time.Since(start)
+}
+
+// TestCachedLatencyFasterThanUncached proves that a TTL cache hit is faster
+// than a cache miss when the origin has non-trivial response time.
+//
+// The origin sleeps originDelay before responding. On a cache miss the proxy
+// must wait for that delay. On a TTL cache hit the origin is never contacted,
+// so the response time is just memory access — far below originDelay.
+func TestCachedLatencyFasterThanUncached(t *testing.T) {
+	const originDelay = 50 * time.Millisecond
+
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(originDelay)
+		fmt.Fprint(w, "hello")
+	}))
+	defer origin.Close()
+
+	proxyAddr, stop := startProxy(t)
+	defer stop()
+
+	targetURL := "http://" + origin.Listener.Addr().String() + "/latency"
+
+	// Cache miss: proxy contacts origin and waits for it to respond.
+	missLatency := proxyRequestTimed(t, proxyAddr, targetURL)
+	t.Logf("Cache miss latency: %v  (origin delay = %v)", missLatency, originDelay)
+
+	// Cache hit: proxy serves from memory, origin is never contacted.
+	hitLatency := proxyRequestTimed(t, proxyAddr, targetURL)
+	t.Logf("Cache hit  latency: %v  (served from memory)", hitLatency)
+
+	if missLatency < originDelay {
+		t.Errorf("miss latency %v < origin delay %v — origin delay not taking effect",
+			missLatency, originDelay)
+	}
+	if hitLatency >= missLatency {
+		t.Errorf("cache hit latency %v >= miss latency %v — TTL cache not helping",
+			hitLatency, missLatency)
+	}
+
+	speedup := float64(missLatency) / float64(hitLatency)
+	t.Logf("Speedup: %.1fx", speedup)
+}
+
+// TestLatencySummary prints a table of miss vs hit latency across different
+// simulated origin delays. Run with -v to see the output.
+func TestLatencySummary(t *testing.T) {
+	delays := []struct {
+		label string
+		delay time.Duration
+	}{
+		{"10ms origin", 10 * time.Millisecond},
+		{"50ms origin", 50 * time.Millisecond},
+		{"100ms origin", 100 * time.Millisecond},
+	}
+
+	for _, tc := range delays {
+		t.Run(tc.label, func(t *testing.T) {
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				time.Sleep(tc.delay)
+				fmt.Fprint(w, strings.Repeat("x", 4096))
+			}))
+			defer origin.Close()
+
+			proxyAddr, stop := startProxy(t)
+			defer stop()
+
+			targetURL := "http://" + origin.Listener.Addr().String() + "/page"
+
+			// Warm the cache with one miss.
+			missLatency := proxyRequestTimed(t, proxyAddr, targetURL)
+
+			// Average several hits for a stable reading.
+			const rounds = 5
+			var total time.Duration
+			for range rounds {
+				total += proxyRequestTimed(t, proxyAddr, targetURL)
+			}
+			avgHit := total / rounds
+
+			speedup := float64(missLatency) / float64(avgHit)
+			saved := missLatency - avgHit
+
+			t.Logf("Origin delay: %-10v | Miss: %-10v | Hit (avg): %-10v | Saved: %-10v | Speedup: %.1fx",
+				tc.delay,
+				missLatency.Round(time.Millisecond),
+				avgHit.Round(time.Millisecond),
+				saved.Round(time.Millisecond),
+				speedup,
+			)
+
+			if avgHit >= missLatency {
+				t.Errorf("avg hit latency %v >= miss latency %v",
+					avgHit.Round(time.Millisecond), missLatency.Round(time.Millisecond))
+			}
+		})
+	}
+}
+
 // TestBandwidthSummary prints a human-readable summary table — useful for
 // documentation and the assignment write-up.
 func TestBandwidthSummary(t *testing.T) {

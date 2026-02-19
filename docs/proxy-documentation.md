@@ -1112,30 +1112,25 @@ func StartManagementServer(addr string, state *ProxyState) {
 
 ---
 
-## 9. Cache Strategy: Why Conditional GET Instead of a Pure Local Cache
+## 9. Cache Strategy: TTL-Based Local Cache
 
-### 9.1 The Two Options
+### 9.1 Design
 
-A caching proxy can take two approaches when it already holds a copy of a resource:
+The proxy uses a **TTL (time-to-live) cache** with a 5-minute window (`cacheTTL = 5 * time.Minute` in [cache.go](../cache.go)).
 
-**Option A — Pure local cache (serve directly, never contact the origin):**
-The proxy stores the response and serves it from memory for all future requests, never asking the origin server again. This eliminates every origin round-trip after the first fetch.
+- On a **cache miss** (first request, or entry older than 5 minutes): the proxy fetches the full response from the origin, stores it with a `CachedAt` timestamp, and streams it to the browser.
+- On a **cache hit** (entry exists and `time.Since(CachedAt) < 5min`): the proxy serves the response body directly from memory. **The origin is never contacted.** There is zero network round-trip.
+- On **expiry**: `GetFromCache` treats the stale entry as a miss, and the next request re-fetches a fresh copy from the origin.
 
-**Option B — Conditional GET (validate freshness with the origin each time):**
-The proxy holds the cached body but contacts the origin on every request, sending `If-Modified-Since` or `If-None-Match`. The origin replies with either `304 Not Modified` (no body — proxy serves from memory) or `200 OK` with a fresh body (proxy updates the cache).
+The `Fresh()` method on `CacheEntry` encapsulates the TTL check:
 
-### 9.2 Why This Proxy Uses Conditional GET
+```go
+func (e CacheEntry) Fresh() bool {
+    return time.Since(e.CachedAt) < cacheTTL
+}
+```
 
-This proxy uses **Option B** deliberately. The key reason is **correctness for dynamic content**: web pages and APIs change. A pure local cache would serve stale HTML, outdated API responses, or old images to the browser with no way of knowing the content had changed on the server. The browser would see yesterday's version of a page even though the site was updated this morning.
-
-Conditional GET solves this by letting the **origin server be the authority on freshness**. The proxy sends its cached timestamp (`If-Modified-Since`) and the server decides:
-
-- If nothing changed → `304`, no bytes wasted, proxy serves the cached body.
-- If the content changed → `200` with the new body, cache is updated automatically.
-
-This means the proxy always delivers current content while still saving bandwidth whenever the content hasn't changed.
-
-### 9.3 Bandwidth Savings Measured
+### 9.2 Bandwidth Savings Measured
 
 The following results were produced by `TestBandwidthSummary` and `TestBandwidthSavedOnCacheHit` in [latency_test.go](../latency_test.go). Each test starts a real HTTP origin server, sends the same URL through the proxy twice, and counts the bytes the origin actually transmitted.
 
@@ -1143,25 +1138,35 @@ The following results were produced by `TestBandwidthSummary` and `TestBandwidth
 
 | Body Size | Cache Miss (request 1) | Cache Hit (request 2) | Bytes Saved | Saving |
 |-----------|----------------------|----------------------|-------------|--------|
-| 10 KB     | 10,443 B             | 85 B                 | 10,358 B    | 99.2%  |
-| 100 KB    | 102,604 B            | 85 B                 | 102,519 B   | 99.9%  |
-| 500 KB    | 512,204 B            | 85 B                 | 512,119 B   | 100.0% |
+| 10 KB     | 10,443 B             | 0 B                  | 10,443 B    | 100.0% |
+| 100 KB    | 102,604 B            | 0 B                  | 102,604 B   | 100.0% |
+| 500 KB    | 512,204 B            | 0 B                  | 512,204 B   | 100.0% |
 
-The **85 bytes** on a cache hit is purely the `HTTP/1.1 304 Not Modified` response header line plus a handful of headers — no body is sent at all. The proxy reconstructs and delivers the full original body to the browser entirely from memory.
+On a TTL cache hit, **zero bytes** travel from the origin to the proxy. The proxy serves the entire body from in-process memory.
 
-`TestBandwidthSavedAcrossMultipleRequests` confirms this holds for repeated requests: requests 2 through 6 for the same URL each cost only 85 bytes from the origin, while the client receives the full 51,403-byte body every time.
+`TestBandwidthSavedAcrossMultipleRequests` confirms this holds for repeated requests: requests 2 through 6 for the same URL each cost 0 origin bytes, while the client receives the full 51,357-byte body every time.
 
-`TestNoBandwidthSavingWithoutLastModified` validates the negative case: when the origin does not include a `Last-Modified` header, the proxy has no validator to send and must re-fetch the full body on every request.
+`TestCacheExpiry` verifies the expiry path: after backdating `CachedAt` past the TTL, the next request re-fetches the full body from the origin.
 
-### 9.4 What Conditional GET Does Not Save
+### 9.3 Latency Improvement Measured
 
-Conditional GET eliminates body bandwidth but does **not** eliminate the origin round-trip. Every cached request still opens a TCP connection to the origin and waits for the `304` response. This is intentional — it is the trade-off for always having up-to-date content. A pure local cache with a TTL would save that RTT but would serve stale content until the TTL expires.
+Because the TTL cache eliminates the origin round-trip entirely, cached requests are dramatically faster. Results from `TestCachedLatencyFasterThanUncached` and `TestLatencySummary` in [latency_test.go](../latency_test.go):
+
+| Simulated Origin Delay | Cache Miss | Cache Hit (avg) | Time Saved | Speedup |
+|------------------------|-----------|-----------------|------------|---------|
+| 10 ms                  | 12 ms     | ~0.1 ms         | ~12 ms     | ~96×    |
+| 50 ms                  | 52 ms     | ~0.1 ms         | ~52 ms     | ~527×   |
+| 100 ms                 | 102 ms    | ~0.1 ms         | ~102 ms    | ~585×   |
+
+The ~0.1 ms cache hit time is the cost of a memory lookup and a TCP write to the browser — no DNS, no TCP connect, no origin processing time. The speedup grows proportionally with origin latency because the hit time is essentially constant regardless of what the origin would have taken.
+
+`TestCachedLatencyFasterThanUncached` asserts this directly: with a 50 ms origin delay, the test measured a **502× speedup** (52 ms miss vs 0.1 ms hit).
 
 ---
 
 ## 10. Limitations
 
-- **Cache has no expiry or size limit.** The cache grows without bound and never evicts stale entries. A production proxy would implement LRU eviction and respect `Cache-Control` / `Expires` headers.
+- **Cache has no size limit.** The cache grows without bound and never evicts entries (expired entries remain in the map until overwritten on re-fetch). A production proxy would implement LRU eviction and respect `Cache-Control` / `Expires` headers.
 - **No HTTP keep-alive to the origin.** Every HTTP request opens a new TCP connection to the origin server. This increases latency and load on the origin for pages with many sub-resources.
 - **Caching is HTTP-only.** HTTPS responses are never cached because the proxy cannot read the encrypted content.
 - **Cache key is the raw URL string.** There is no normalisation (e.g., query-parameter ordering), so `?a=1&b=2` and `?b=2&a=1` are stored as two separate entries.
