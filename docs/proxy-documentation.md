@@ -39,7 +39,7 @@ A single `ProxyState` singleton (protected by a `sync.RWMutex`) is shared betwee
                      │        │
           CONNECT    │        │  GET/POST/...
                      │        │
-         ┌───────────▼──┐  ┌──▼──────────────┐
+         ┌───────────▼──┐  ┌──▼───────────────┐
          │ handleHTTPS  │  │  handleHTTP      │
          │ (TLS tunnel) │  │  (HTTP + cache)  │
          └───────┬──────┘  └────────┬─────────┘
@@ -1116,11 +1116,12 @@ func StartManagementServer(addr string, state *ProxyState) {
 
 ### 9.1 Design
 
-The proxy uses a **TTL (time-to-live) cache** with a 5-minute window (`cacheTTL = 5 * time.Minute` in [cache.go](../cache.go)).
+The proxy uses a **TTL (time-to-live) cache** with a 5-minute window and a hard limit of 100 entries (constants `cacheTTL` and `cacheMaxEntries` in [cache.go](../cache.go)).
 
 - On a **cache miss** (first request, or entry older than 5 minutes): the proxy fetches the full response from the origin, stores it with a `CachedAt` timestamp, and streams it to the browser.
 - On a **cache hit** (entry exists and `time.Since(CachedAt) < 5min`): the proxy serves the response body directly from memory. **The origin is never contacted.** There is zero network round-trip.
 - On **expiry**: `GetFromCache` treats the stale entry as a miss, and the next request re-fetches a fresh copy from the origin.
+- On **size limit**: before every insert, `evict()` is called to ensure the map never exceeds 100 entries.
 
 The `Fresh()` method on `CacheEntry` encapsulates the TTL check:
 
@@ -1206,11 +1207,56 @@ The key correctness property is that **the proxy never serves stale content beyo
 
 The TTL approach trades a bounded staleness window (≤ 5 minutes) for dramatic bandwidth and latency savings on every request within that window.
 
+### 9.5 Cache Size Limit and Eviction
+
+Without a size bound the cache map would grow indefinitely, one entry per unique URL ever requested. Two constants in [cache.go](../cache.go) cap this:
+
+```go
+const cacheTTL       = 5 * time.Minute
+const cacheMaxEntries = 100
+```
+
+`AddToCache` calls `Cache.evict()` before every insert. `evict()` runs in two passes while the `ProxyState` write lock is already held:
+
+```go
+func (c *Cache) evict() {
+    // Pass 1: drop all expired entries (no value keeping them)
+    for k, e := range c.entries {
+        if !e.Fresh() {
+            delete(c.entries, k)
+        }
+    }
+    if len(c.entries) < cacheMaxEntries {
+        return
+    }
+    // Pass 2: still at limit — remove the single oldest fresh entry
+    var oldestKey string
+    var oldestTime time.Time
+    for k, e := range c.entries {
+        if oldestKey == "" || e.CachedAt.Before(oldestTime) {
+            oldestKey = k
+            oldestTime = e.CachedAt
+        }
+    }
+    if oldestKey != "" {
+        delete(c.entries, oldestKey)
+    }
+}
+```
+
+**Eviction priority:**
+1. All expired entries are deleted first — they carry no useful data.
+2. Only if the cache is still full after purging expired entries is a fresh entry removed, choosing the one with the earliest `CachedAt` (the least-recently-added entry).
+
+`TestCacheEviction` in [latency_test.go](../latency_test.go) verifies both properties:
+
+- **Sub-test 1 — oldest fresh entry at limit**: fills the cache to 100, backdates each entry so `url/0` is oldest. Adding entry 101 evicts `url/0` and holds the size at 100.
+- **Sub-test 2 — expired before fresh**: fills with 99 fresh entries plus 1 expired entry. Adding a new entry evicts only the expired one; all 99 fresh entries are preserved.
+
 ---
 
 ## 10. Limitations
 
-- **Cache has no size limit.** The cache grows without bound and never evicts entries (expired entries remain in the map until overwritten on re-fetch). A production proxy would implement LRU eviction and respect `Cache-Control` / `Expires` headers.
 - **No HTTP keep-alive to the origin.** Every HTTP request opens a new TCP connection to the origin server. This increases latency and load on the origin for pages with many sub-resources.
 - **Caching is HTTP-only.** HTTPS responses are never cached because the proxy cannot read the encrypted content.
 - **Cache key is the raw URL string.** There is no normalisation (e.g., query-parameter ordering), so `?a=1&b=2` and `?b=2&a=1` are stored as two separate entries.

@@ -499,6 +499,87 @@ func TestExpiredTTLModifiedData(t *testing.T) {
 	t.Logf("  Content after update      : v2 correctly delivered (proxy re-fetched new content)")
 }
 
+// TestCacheEviction verifies the size-based eviction policy.
+//
+// It fills the cache to cacheMaxEntries using distinct URLs, each with a
+// known CachedAt offset so the oldest entry is identifiable. Adding one more
+// entry must:
+//
+//  1. Keep len(entries) <= cacheMaxEntries
+//  2. Evict the entry with the earliest CachedAt (oldest fresh entry)
+//
+// A second sub-test verifies that expired entries are evicted before fresh
+// ones, regardless of age.
+func TestCacheEviction(t *testing.T) {
+	t.Run("evicts oldest fresh entry at limit", func(t *testing.T) {
+		state = NewProxyState()
+
+		// Fill cache to the limit. Entry "url/0" gets the earliest CachedAt
+		// because we backdate each entry by (cacheMaxEntries - i) seconds, so
+		// url/0 is oldest, url/99 is newest.
+		for i := range cacheMaxEntries {
+			key := fmt.Sprintf("http://example.com/url/%d", i)
+			state.AddToCache(key, CacheEntry{Body: []byte("x")})
+			// Backdate so earlier entries appear older.
+			state.mu.Lock()
+			e := state.Cache.entries[key]
+			e.CachedAt = e.CachedAt.Add(-time.Duration(cacheMaxEntries-i) * time.Second)
+			state.Cache.entries[key] = e
+			state.mu.Unlock()
+		}
+
+		if got := len(state.Cache.entries); got != cacheMaxEntries {
+			t.Fatalf("after filling: cache size = %d, want %d", got, cacheMaxEntries)
+		}
+
+		// Adding one more entry should evict url/0 (oldest CachedAt).
+		state.AddToCache("http://example.com/url/new", CacheEntry{Body: []byte("new")})
+
+		if got := len(state.Cache.entries); got != cacheMaxEntries {
+			t.Errorf("after overflow: cache size = %d, want %d (limit)", got, cacheMaxEntries)
+		}
+		state.mu.RLock()
+		_, oldestStillPresent := state.Cache.entries["http://example.com/url/0"]
+		state.mu.RUnlock()
+		if oldestStillPresent {
+			t.Error("url/0 (oldest entry) should have been evicted but is still present")
+		}
+	})
+
+	t.Run("evicts expired entries before fresh ones", func(t *testing.T) {
+		state = NewProxyState()
+
+		// Fill with cacheMaxEntries-1 fresh entries.
+		for i := range cacheMaxEntries - 1 {
+			state.AddToCache(fmt.Sprintf("http://example.com/fresh/%d", i), CacheEntry{Body: []byte("f")})
+		}
+		// Add one expired entry.
+		expiredKey := "http://example.com/expired"
+		state.AddToCache(expiredKey, CacheEntry{Body: []byte("old")})
+		state.mu.Lock()
+		e := state.Cache.entries[expiredKey]
+		e.CachedAt = e.CachedAt.Add(-cacheTTL - time.Second)
+		state.Cache.entries[expiredKey] = e
+		state.mu.Unlock()
+
+		// Cache is now at cacheMaxEntries with one expired entry.
+		// Adding a new entry should evict the expired entry, not a fresh one.
+		state.AddToCache("http://example.com/trigger", CacheEntry{Body: []byte("new")})
+
+		state.mu.RLock()
+		_, expiredStillPresent := state.Cache.entries[expiredKey]
+		cacheSize := len(state.Cache.entries)
+		state.mu.RUnlock()
+
+		if expiredStillPresent {
+			t.Error("expired entry should have been evicted before any fresh entry")
+		}
+		if cacheSize != cacheMaxEntries {
+			t.Errorf("cache size = %d, want %d", cacheSize, cacheMaxEntries)
+		}
+	})
+}
+
 // BenchmarkUncachedHTTP measures bytes-per-operation for cache-miss requests.
 func BenchmarkUncachedHTTP(b *testing.B) {
 	state = NewProxyState()

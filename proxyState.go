@@ -107,6 +107,7 @@ func (s *ProxyState) AddToCache(key string, resp CacheEntry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	resp.CachedAt = time.Now()
+	s.Cache.evict()
 	s.Cache.entries[key] = resp
 }
 
