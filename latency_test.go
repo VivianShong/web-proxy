@@ -282,6 +282,223 @@ func TestCacheExpiry(t *testing.T) {
 	}
 }
 
+// TestExpiredTTLUnchangedData measures the bandwidth and latency cost when the
+// TTL has expired but the origin content is unchanged.
+//
+// After expiry the proxy re-fetches the full body from the origin even though
+// the data has not changed — there is no conditional GET optimisation once the
+// TTL cache is in use. Bandwidth and latency revert to full-miss cost.
+//
+// Sequence:
+//
+//	Request 1 (miss)     — full fetch, origin bytes = bodySize, CachedAt set
+//	Request 2 (TTL hit)  — served from memory, origin bytes = 0
+//	[expire cache entry by backdating CachedAt]
+//	Request 3 (expired)  — full re-fetch, origin bytes ≈ bodySize (same as miss)
+func TestExpiredTTLUnchangedData(t *testing.T) {
+	const bodySize = 50 * 1024
+	body := strings.Repeat("u", bodySize)
+
+	var requestCount atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, body)
+	})
+
+	origin, counter := newCountingServer(handler)
+	defer origin.Close()
+
+	proxyAddr, stop := startProxy(t)
+	defer stop()
+
+	targetURL := "http://" + origin.Listener.Addr().String() + "/unchanged"
+
+	// ── Request 1: cache miss ──────────────────────────────────────────────
+	counter.written.Store(0)
+	start := time.Now()
+	proxyRequest(t, proxyAddr, targetURL)
+	missLatency := time.Since(start)
+	missOriginBytes := int(counter.written.Load())
+	t.Logf("Request 1 (miss):     origin bytes = %6d  latency = %v",
+		missOriginBytes, missLatency.Round(time.Millisecond))
+
+	// ── Request 2: TTL hit — origin not contacted ──────────────────────────
+	counter.written.Store(0)
+	start = time.Now()
+	proxyRequest(t, proxyAddr, targetURL)
+	hitLatency := time.Since(start)
+	hitOriginBytes := int(counter.written.Load())
+	t.Logf("Request 2 (TTL hit):  origin bytes = %6d  latency = %v",
+		hitOriginBytes, hitLatency.Round(time.Millisecond))
+
+	if hitOriginBytes != 0 {
+		t.Errorf("request 2: expected 0 origin bytes (TTL hit), got %d", hitOriginBytes)
+	}
+
+	// ── Expire the cache entry ─────────────────────────────────────────────
+	state.mu.Lock()
+	if entry, ok := state.Cache.entries[targetURL]; ok {
+		entry.CachedAt = entry.CachedAt.Add(-cacheTTL - time.Second)
+		state.Cache.entries[targetURL] = entry
+	}
+	state.mu.Unlock()
+
+	// ── Request 3: expired — full re-fetch, data unchanged ─────────────────
+	counter.written.Store(0)
+	start = time.Now()
+	proxyRequest(t, proxyAddr, targetURL)
+	expiredLatency := time.Since(start)
+	expiredOriginBytes := int(counter.written.Load())
+	t.Logf("Request 3 (expired):  origin bytes = %6d  latency = %v  (full re-fetch)",
+		expiredOriginBytes, expiredLatency.Round(time.Millisecond))
+
+	// After expiry, bandwidth cost reverts to the full-miss cost.
+	if expiredOriginBytes < bodySize {
+		t.Errorf("request 3: expected >= %d origin bytes after expiry, got %d",
+			bodySize, expiredOriginBytes)
+	}
+	// Origin was contacted on request 1 (miss) and request 3 (expired re-fetch).
+	if got := int(requestCount.Load()); got != 2 {
+		t.Errorf("origin hit %d times, want 2 (initial miss + expiry re-fetch)", got)
+	}
+
+	bandwidthSaved := 100 * float64(missOriginBytes-hitOriginBytes) / float64(missOriginBytes)
+	t.Logf("Summary:")
+	t.Logf("  TTL hit  bandwidth saving : %.1f%%  (0 origin bytes)", bandwidthSaved)
+	t.Logf("  TTL hit  latency saving   : %v  (%.1fx faster than miss)",
+		(missLatency - hitLatency).Round(time.Millisecond),
+		float64(missLatency)/float64(hitLatency))
+	t.Logf("  After expiry bandwidth    : %d bytes  (= full miss cost, no saving)", expiredOriginBytes)
+	t.Logf("  After expiry latency      : %v  (= full miss cost)", expiredLatency.Round(time.Millisecond))
+}
+
+// TestExpiredTTLModifiedData verifies proxy correctness and measures cost when
+// the TTL has expired and the origin content has changed.
+//
+// When the cache expires the proxy performs a full unconditional GET. If the
+// origin has changed its response, the proxy caches and serves the new content.
+// Bandwidth and latency are identical to a cache miss (full re-fetch cost).
+//
+// Sequence:
+//
+//	Request 1 (miss)       — fetches v1 body, origin bytes = bodySize
+//	Request 2 (TTL hit)    — serves v1 from memory, origin bytes = 0
+//	[expire cache; origin now serves v2]
+//	Request 3 (expired)    — full re-fetch, receives v2, origin bytes ≈ bodySize
+//	Request 4 (TTL hit v2) — serves v2 from memory, origin bytes = 0
+func TestExpiredTTLModifiedData(t *testing.T) {
+	const bodySize = 50 * 1024
+
+	// version controls which body the origin serves.
+	var version atomic.Int32
+	version.Store(1)
+
+	bodyV1 := strings.Repeat("v", bodySize)
+	bodyV2 := strings.Repeat("w", bodySize)
+
+	var requestCount atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.Header().Set("Content-Type", "text/plain")
+		if version.Load() == 1 {
+			fmt.Fprint(w, bodyV1)
+		} else {
+			fmt.Fprint(w, bodyV2)
+		}
+	})
+
+	origin, counter := newCountingServer(handler)
+	defer origin.Close()
+
+	proxyAddr, stop := startProxy(t)
+	defer stop()
+
+	targetURL := "http://" + origin.Listener.Addr().String() + "/modified"
+
+	// ── Request 1: cache miss — origin serves v1 ──────────────────────────
+	counter.written.Store(0)
+	start := time.Now()
+	resp1, _ := proxyRequest(t, proxyAddr, targetURL)
+	missLatency := time.Since(start)
+	missOriginBytes := int(counter.written.Load())
+	t.Logf("Request 1 (miss v1):  origin bytes = %6d  latency = %v",
+		missOriginBytes, missLatency.Round(time.Millisecond))
+
+	if !strings.Contains(resp1, bodyV1[:20]) {
+		t.Errorf("request 1: expected v1 body, got: %.80s", resp1)
+	}
+
+	// ── Request 2: TTL hit — still v1 from memory ─────────────────────────
+	counter.written.Store(0)
+	start = time.Now()
+	resp2, _ := proxyRequest(t, proxyAddr, targetURL)
+	hitLatency := time.Since(start)
+	hitOriginBytes := int(counter.written.Load())
+	t.Logf("Request 2 (TTL hit):  origin bytes = %6d  latency = %v",
+		hitOriginBytes, hitLatency.Round(time.Millisecond))
+
+	if hitOriginBytes != 0 {
+		t.Errorf("request 2: expected 0 origin bytes (TTL hit), got %d", hitOriginBytes)
+	}
+	if !strings.Contains(resp2, bodyV1[:20]) {
+		t.Errorf("request 2: expected v1 body from cache, got different content")
+	}
+
+	// ── Expire the cache AND switch the origin to v2 ──────────────────────
+	version.Store(2)
+	state.mu.Lock()
+	if entry, ok := state.Cache.entries[targetURL]; ok {
+		entry.CachedAt = entry.CachedAt.Add(-cacheTTL - time.Second)
+		state.Cache.entries[targetURL] = entry
+	}
+	state.mu.Unlock()
+
+	// ── Request 3: expired — proxy re-fetches, receives new v2 ────────────
+	counter.written.Store(0)
+	start = time.Now()
+	resp3, _ := proxyRequest(t, proxyAddr, targetURL)
+	expiredLatency := time.Since(start)
+	expiredOriginBytes := int(counter.written.Load())
+	t.Logf("Request 3 (expired):  origin bytes = %6d  latency = %v  (re-fetch v2)",
+		expiredOriginBytes, expiredLatency.Round(time.Millisecond))
+
+	// Full re-fetch cost.
+	if expiredOriginBytes < bodySize {
+		t.Errorf("request 3: expected >= %d origin bytes after expiry, got %d",
+			bodySize, expiredOriginBytes)
+	}
+	// Must deliver the NEW content.
+	if !strings.Contains(resp3, bodyV2[:20]) {
+		t.Errorf("request 3: expected v2 body after expiry+update, got old content")
+	}
+
+	// ── Request 4: TTL hit — now caches v2 ────────────────────────────────
+	counter.written.Store(0)
+	start = time.Now()
+	resp4, _ := proxyRequest(t, proxyAddr, targetURL)
+	hitV2Latency := time.Since(start)
+	hitV2OriginBytes := int(counter.written.Load())
+	t.Logf("Request 4 (TTL hit v2): origin bytes = %6d  latency = %v",
+		hitV2OriginBytes, hitV2Latency.Round(time.Millisecond))
+
+	if hitV2OriginBytes != 0 {
+		t.Errorf("request 4: expected 0 origin bytes (new TTL hit), got %d", hitV2OriginBytes)
+	}
+	if !strings.Contains(resp4, bodyV2[:20]) {
+		t.Errorf("request 4: expected v2 body served from cache")
+	}
+
+	t.Logf("Summary:")
+	t.Logf("  TTL hit bandwidth saving  : 100.0%%  (0 origin bytes)")
+	t.Logf("  TTL hit latency saving    : %v  (%.1fx faster)",
+		(missLatency - hitLatency).Round(time.Millisecond),
+		float64(missLatency)/float64(hitLatency))
+	t.Logf("  Expired re-fetch bandwidth: %d bytes  (full miss cost)", expiredOriginBytes)
+	t.Logf("  Expired re-fetch latency  : %v  (full miss cost)", expiredLatency.Round(time.Millisecond))
+	t.Logf("  Content after update      : v2 correctly delivered (proxy re-fetched new content)")
+}
+
 // BenchmarkUncachedHTTP measures bytes-per-operation for cache-miss requests.
 func BenchmarkUncachedHTTP(b *testing.B) {
 	state = NewProxyState()

@@ -1162,6 +1162,50 @@ The ~0.1 ms cache hit time is the cost of a memory lookup and a TCP write to the
 
 `TestCachedLatencyFasterThanUncached` asserts this directly: with a 50 ms origin delay, the test measured a **502× speedup** (52 ms miss vs 0.1 ms hit).
 
+### 9.4 Expired TTL: Re-fetch Cost
+
+When the 5-minute TTL elapses the cached entry is treated as a miss. The proxy performs a **full unconditional GET** to the origin, regardless of whether the content has actually changed. This means both bandwidth and latency revert to the same cost as the original cache miss.
+
+#### Case A — TTL expired, data unchanged
+
+The origin still serves the same content, but the proxy cannot know this without asking. It fetches the entire body again.
+
+`TestExpiredTTLUnchangedData` measures this in three requests:
+
+| Step | Origin Bytes | Latency | Note |
+|------|-------------|---------|------|
+| Request 1 — cache miss | 51,342 B | 2 ms | First fetch; entry stored |
+| Request 2 — TTL hit | 0 B | <1 ms | Served from memory |
+| Request 3 — expired re-fetch | 51,342 B | 1 ms | Full re-fetch (same cost as miss) |
+
+After expiry the bandwidth saving drops from **100% back to 0%** until the cache is repopulated by request 3 and the TTL window resets.
+
+#### Case B — TTL expired, data modified
+
+If the origin content changes during the TTL window, the browser sees the stale cached version until the TTL expires. Once the TTL elapses the proxy re-fetches and correctly delivers the updated content.
+
+`TestExpiredTTLModifiedData` measures this in four requests:
+
+| Step | Origin Bytes | Latency | Content | Note |
+|------|-------------|---------|---------|------|
+| Request 1 — cache miss | 51,342 B | 1 ms | v1 | Initial fetch of v1 |
+| Request 2 — TTL hit | 0 B | <1 ms | v1 | Stale v1 served from memory |
+| [origin updated to v2; cache expired] | | | | |
+| Request 3 — expired re-fetch | 51,342 B | 1 ms | **v2** | Full re-fetch delivers new content |
+| Request 4 — TTL hit | 0 B | <1 ms | v2 | v2 now cached; 0 origin bytes |
+
+The key correctness property is that **the proxy never serves stale content beyond the TTL window**. After expiry, the re-fetch always picks up whatever the origin currently serves — whether v1 or v2.
+
+#### Trade-off summary
+
+| Scenario | Bandwidth vs. no cache | Latency vs. no cache | Content freshness |
+|----------|----------------------|---------------------|-------------------|
+| Within TTL | **−100%** (zero origin bytes) | **~500× faster** | At most 5 min stale |
+| TTL just expired | No saving (full re-fetch) | Same as fresh miss | Always current |
+| After re-fetch | −100% again (new TTL window) | ~500× faster again | At most 5 min stale |
+
+The TTL approach trades a bounded staleness window (≤ 5 minutes) for dramatic bandwidth and latency savings on every request within that window.
+
 ---
 
 ## 10. Limitations
