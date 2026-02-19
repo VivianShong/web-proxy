@@ -114,18 +114,26 @@ func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string) {
 	if headers == nil {
 		return
 	}
-	// Check cache
+	// Check cache — GetFromCache returns false for missing or expired entries.
 	cachedEntry, hasCache := state.GetFromCache(url)
 
-	// Connect to server
+	// Fresh cache hit: serve directly from memory, no origin contact needed.
+	if hasCache {
+		log.Printf("CACHE HIT (TTL): %s", url)
+		logRequest(method, url, "Cached", clientConn)
+		sendCachedResponse(clientConn, cachedEntry)
+		return
+	}
+
+	// Cache miss or expired: fetch from origin.
 	serverConn, err := net.Dial("tcp", address)
 	if err != nil {
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 	defer serverConn.Close()
-	// Send request to server
-	sendRequestToServer(serverConn, method, path, headers, cachedEntry, hasCache)
+	// Send request to server (no conditional headers — we are doing a full fetch)
+	sendRequestToServer(serverConn, method, path, headers, CacheEntry{}, false)
 	log.Printf("  → request to %s", address)
 	// Forward request body (async)
 	go io.Copy(serverConn, reader)
@@ -135,12 +143,7 @@ func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string) {
 	if statusLine == "" {
 		return
 	}
-
-	// Handle response
-	if hasCache && statusCode == 304 {
-		log.Printf("CACHE HIT: %s", url)
-		logRequest(method, url, "Cached", clientConn)
-		sendCachedResponse(clientConn, cachedEntry)
+	if statusCode == 0 {
 		return
 	}
 	logRequest(method, url, "Allowed", clientConn)

@@ -102,30 +102,20 @@ func newCountingServer(handler http.Handler) (*httptest.Server, *countingListene
 
 // TestBandwidthSavedOnCacheHit is the core bandwidth test.
 //
-// The origin returns a large body (bodySize bytes) with a Last-Modified header.
-// We send the same URL twice through the proxy:
+// With TTL caching, a cache hit skips the origin entirely — zero bytes are
+// fetched from the origin on the second request. The proxy serves the body
+// directly from memory without contacting the origin at all.
 //
-//   - Request 1 (cache miss): origin must send the full body to the proxy.
-//   - Request 2 (cache hit):  proxy sends If-Modified-Since; origin replies 304
-//     with no body. The proxy serves the cached body to the browser from memory.
-//
-// We count origin→proxy bytes for each request and assert that the second
-// request transferred significantly fewer bytes from the origin.
+//   - Request 1 (cache miss):  origin sends the full body; proxy stores it.
+//   - Request 2 (TTL cache hit): origin receives no request; proxy serves from memory.
 func TestBandwidthSavedOnCacheHit(t *testing.T) {
-	const bodySize = 100 * 1024 // 100 KB — large enough to measure clearly
+	const bodySize = 100 * 1024 // 100 KB
 	body := strings.Repeat("a", bodySize)
 
-	// requestCount tracks how many times the origin was actually contacted.
 	var requestCount atomic.Int32
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount.Add(1)
-		if r.Header.Get("If-Modified-Since") != "" {
-			// Conditional GET — content unchanged, send no body.
-			w.WriteHeader(http.StatusNotModified)
-			return
-		}
-		w.Header().Set("Last-Modified", "Wed, 01 Jan 2025 00:00:00 GMT")
 		w.Header().Set("Content-Type", "text/plain")
 		fmt.Fprint(w, body)
 	})
@@ -147,59 +137,52 @@ func TestBandwidthSavedOnCacheHit(t *testing.T) {
 	t.Logf("  Origin → proxy : %d bytes", originBytes1)
 	t.Logf("  Proxy  → client: %d bytes", clientBytes1)
 
-	// The origin must have sent at least the body.
 	if originBytes1 < bodySize {
 		t.Errorf("expected origin to send >= %d bytes on cache miss, got %d",
 			bodySize, originBytes1)
 	}
 
-	// ── Request 2: cache hit ──────────────────────────────────────────────
+	// ── Request 2: TTL cache hit ──────────────────────────────────────────
 	counter.written.Store(0)
 	_, clientBytes2 := proxyRequest(t, proxyAddr, targetURL)
 	originBytes2 := int(counter.written.Load())
 
-	t.Logf("Request 2 (cached):")
-	t.Logf("  Origin → proxy : %d bytes  (304, no body)", originBytes2)
+	t.Logf("Request 2 (TTL cache hit):")
+	t.Logf("  Origin → proxy : %d bytes  (origin not contacted)", originBytes2)
 	t.Logf("  Proxy  → client: %d bytes  (served from memory)", clientBytes2)
 
 	// ── Assertions ────────────────────────────────────────────────────────
 
-	// The origin should have been hit twice (once for each request).
-	if got := int(requestCount.Load()); got != 2 {
-		t.Errorf("origin hit %d times, want 2", got)
+	// With TTL caching the origin is only hit once — the second request is
+	// served entirely from memory without an origin round-trip.
+	if got := int(requestCount.Load()); got != 1 {
+		t.Errorf("origin hit %d times, want 1 (TTL cache should skip origin)", got)
 	}
 
-	// On the cached request the origin sends far fewer bytes (just the 304
-	// response headers, no body). Assert it sent less than 10% of the original.
-	threshold := originBytes1 / 10
-	if originBytes2 >= threshold {
-		t.Errorf("cached origin bytes %d >= 10%% of uncached %d (%d) — body was re-sent",
-			originBytes2, originBytes1, threshold)
+	// Zero bytes from origin on cache hit.
+	if originBytes2 != 0 {
+		t.Errorf("cached origin bytes = %d, want 0 (no origin contact within TTL)",
+			originBytes2)
 	}
 
 	savedBytes := originBytes1 - originBytes2
 	savingPct := 100 * float64(savedBytes) / float64(originBytes1)
 	t.Logf("Bandwidth saved: %d bytes (%.1f%%)", savedBytes, savingPct)
 
-	// The client must receive the full body both times (cache serves it from memory).
+	// Client must receive the full body from the proxy's memory.
 	if clientBytes2 < bodySize {
 		t.Errorf("cached response delivered only %d bytes to client, want >= %d",
 			clientBytes2, bodySize)
 	}
 }
 
-// TestBandwidthSavedAcrossMultipleRequests checks that repeated requests keep
-// saving bandwidth — not just the second one.
+// TestBandwidthSavedAcrossMultipleRequests checks that repeated requests within
+// the TTL window all serve from memory — zero origin bytes after the first fetch.
 func TestBandwidthSavedAcrossMultipleRequests(t *testing.T) {
 	const bodySize = 50 * 1024 // 50 KB
 	body := strings.Repeat("b", bodySize)
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("If-Modified-Since") != "" {
-			w.WriteHeader(http.StatusNotModified)
-			return
-		}
-		w.Header().Set("Last-Modified", "Fri, 01 Jan 2021 00:00:00 GMT")
 		fmt.Fprint(w, body)
 	})
 
@@ -227,10 +210,10 @@ func TestBandwidthSavedAcrossMultipleRequests(t *testing.T) {
 		t.Logf("Request %d (cached) origin bytes: %d, client bytes: %d",
 			i, originBytes, clientBytes)
 
-		// Origin should send << full body (just a 304 header).
-		if originBytes >= uncachedOriginBytes/10 {
-			t.Errorf("request %d: origin sent %d bytes, expected < %d (10%% of full body)",
-				i, originBytes, uncachedOriginBytes/10)
+		// Within TTL: origin should receive no request at all — 0 bytes.
+		if originBytes != 0 {
+			t.Errorf("request %d: origin sent %d bytes, expected 0 (TTL hit, no origin contact)",
+				i, originBytes)
 		}
 		// Client must still receive the full body from the proxy's cache.
 		if clientBytes < bodySize {
@@ -240,16 +223,16 @@ func TestBandwidthSavedAcrossMultipleRequests(t *testing.T) {
 	}
 }
 
-// TestNoBandwidthSavingWithoutLastModified confirms that the cache does NOT
-// send conditional GET headers when the origin omitted Last-Modified.
-// Without a validator, the proxy cannot do a conditional GET, so it must
-// re-fetch the full body each time.
-func TestNoBandwidthSavingWithoutLastModified(t *testing.T) {
-	const bodySize = 10 * 1024
+// TestCacheExpiry verifies that after the TTL elapses the proxy treats the
+// entry as a miss and re-fetches the full body from the origin.
+// We shrink the TTL to 50 ms for the duration of this test.
+func TestCacheExpiry(t *testing.T) {
+	const bodySize = 4 * 1024
 	body := strings.Repeat("c", bodySize)
+	var requestCount atomic.Int32
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Deliberately no Last-Modified header — proxy cannot cache-validate.
+		requestCount.Add(1)
 		fmt.Fprint(w, body)
 	})
 
@@ -259,23 +242,43 @@ func TestNoBandwidthSavingWithoutLastModified(t *testing.T) {
 	proxyAddr, stop := startProxy(t)
 	defer stop()
 
-	targetURL := "http://" + origin.Listener.Addr().String() + "/no-validator"
+	targetURL := "http://" + origin.Listener.Addr().String() + "/expiry"
 
+	// Request 1: populates the cache.
 	counter.written.Store(0)
 	proxyRequest(t, proxyAddr, targetURL)
-	firstOriginBytes := int(counter.written.Load())
+	originBytes1 := int(counter.written.Load())
+	t.Logf("Request 1 (miss): origin bytes = %d", originBytes1)
 
+	// Request 2: within TTL — should hit cache, zero origin bytes.
 	counter.written.Store(0)
 	proxyRequest(t, proxyAddr, targetURL)
-	secondOriginBytes := int(counter.written.Load())
+	originBytes2 := int(counter.written.Load())
+	t.Logf("Request 2 (TTL hit): origin bytes = %d", originBytes2)
+	if originBytes2 != 0 {
+		t.Errorf("request 2: expected 0 origin bytes (TTL hit), got %d", originBytes2)
+	}
 
-	t.Logf("Without Last-Modified — request 1 origin bytes: %d, request 2 origin bytes: %d",
-		firstOriginBytes, secondOriginBytes)
+	// Wait for the entry to expire by temporarily patching the CachedAt to the past.
+	state.mu.Lock()
+	if entry, ok := state.Cache.entries[targetURL]; ok {
+		entry.CachedAt = entry.CachedAt.Add(-cacheTTL - time.Second)
+		state.Cache.entries[targetURL] = entry
+	}
+	state.mu.Unlock()
 
-	// Both requests should transfer the full body from the origin.
-	if secondOriginBytes < bodySize {
-		t.Errorf("expected origin to re-send full body (%d bytes) without Last-Modified, got %d",
-			bodySize, secondOriginBytes)
+	// Request 3: TTL expired — proxy must re-fetch from origin.
+	counter.written.Store(0)
+	proxyRequest(t, proxyAddr, targetURL)
+	originBytes3 := int(counter.written.Load())
+	t.Logf("Request 3 (expired, re-fetch): origin bytes = %d", originBytes3)
+
+	if originBytes3 < bodySize {
+		t.Errorf("request 3: expected origin to send >= %d bytes after TTL expiry, got %d",
+			bodySize, originBytes3)
+	}
+	if got := int(requestCount.Load()); got != 2 {
+		t.Errorf("origin hit %d times, want 2 (miss + re-fetch after expiry)", got)
 	}
 }
 
