@@ -1107,6 +1107,7 @@ func StartManagementServer(addr string, state *ProxyState) {
 | **`Connection: close` forced upstream** | Eliminates the need to parse `Content-Length` or `Transfer-Encoding: chunked` to know when the response body ends — we read until EOF. |
 | **CONNECT tunnel (no TLS interception)** | Preserves end-to-end TLS security. No custom certificate authority required. HTTPS content is not visible to the proxy. |
 | **Subdomain blocking via suffix match** | A single blocked entry covers the apex domain and all of its subdomains, which is the common administrator expectation. |
+| **Kill active HTTPS tunnels on block** | When a domain is added to the block list, all open `CONNECT` tunnels to that domain are closed immediately. Without this, a browser that already established a tunnel can continue sending HTTPS requests through it even after the block is applied, because the blocking check only runs at the start of `handleConnection`. Closing the `net.Conn` breaks the `io.Copy` loop instantly, forcing the browser to reconnect — at which point the block check fires and returns 403. |
 | **JSON persistence for blocked hosts** | Simple, human-readable format. The block list survives proxy restarts without a database. |
 | **No external dependencies** | The entire proxy is built on the Go standard library, making it easy to compile and deploy (`go build`). |
 
