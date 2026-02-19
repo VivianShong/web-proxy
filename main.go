@@ -2,17 +2,22 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
 
+var state *ProxyState
+
 func main() {
 	// Initialize shared state
-	state := NewProxyState()
+	state = NewProxyState()
 	if err := state.LoadBlocked("blocked.json"); err != nil {
 		log.Println("No blocked list found, starting fresh.")
 	}
@@ -34,11 +39,11 @@ func main() {
 			log.Println("Error accepting conn:", err)
 			continue
 		}
-		go handleConnection(conn, state)
+		go handleConnection(conn)
 	}
 }
 
-func handleConnection(clientConn net.Conn, state *ProxyState) {
+func handleConnection(clientConn net.Conn) {
 
 	defer clientConn.Close()
 
@@ -62,53 +67,21 @@ func handleConnection(clientConn net.Conn, state *ProxyState) {
 
 	// Check if blocked
 	if state.IsBlocked(host) {
-		handleBlocked(clientConn, reader, state, method, url)
+		logRequest(method, url, "Blocked", clientConn)
+		clientConn.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n<h1>Access Denied</h1>"))
 		return
 	}
-	
-	// Check if in cache
-	// TODO: implement cache
-	
-	state.LogRequest(RequestLog{
-		Time:   time.Now(),
-		Method: method,
-		URL:    url,
-		Status: "Allowed",
-		SrcIP:  clientConn.RemoteAddr().String(),
-	})
 
 	if method == "CONNECT" {
-		handleHTTPS(clientConn, url, state)
+		handleHTTPS(clientConn, url)
 	} else {
 		handleHTTP(clientConn, reader, method, url)
 	}
 }
 
-func handleBlocked(clientConn net.Conn, reader *bufio.Reader, state *ProxyState, method, url string) {
-    // Consume remaining headers so connection is clean
-    cleanConnection(reader)
-    
-    log.Printf("BLOCKED: %s", url)
-    state.LogRequest(RequestLog{
-        Time:   time.Now(),
-        Method: method,
-        URL:    url,
-        Status: "Blocked",
-        SrcIP:  clientConn.RemoteAddr().String(),
-    })
-    clientConn.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\n<h1>Access Denied</h1>"))
-}
+func handleHTTPS(clientConn net.Conn, target string) {
+	logRequest("CONNECT", target, "Allowed", clientConn)
 
-func cleanConnection(reader *bufio.Reader) {
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil || strings.TrimSpace(line) == "" {
-			break
-		}
-	}
-}
-
-func handleHTTPS(clientConn net.Conn, target string, state *ProxyState) {
 	// Connect to target server
 	serverConn, err := net.Dial("tcp", target)
 	if err != nil {
@@ -124,8 +97,8 @@ func handleHTTPS(clientConn net.Conn, target string, state *ProxyState) {
 	log.Printf("  → TUNNEL to %s", target)
 
 	domain, _, _ := net.SplitHostPort(target)
-    state.RegisterConn(domain, clientConn)
-    defer state.UnregisterConn(domain, clientConn)
+	state.RegisterConn(domain, clientConn)
+	defer state.UnregisterConn(domain, clientConn)
 
 	// Copy bytes both directions
 	go io.Copy(serverConn, clientConn)
@@ -133,62 +106,206 @@ func handleHTTPS(clientConn net.Conn, target string, state *ProxyState) {
 }
 
 func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string) {
-	var headers []string
 	host, port, path := parseURL(url)
-	host = host + ":" + port
+	address := host + ":" + port
 
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			return
-		}
-		trimmedLine := strings.TrimSpace(line)
-		headers = append(headers, trimmedLine)
-		log.Println("headers: ", headers)
-		log.Println("host: ", host)
-		if line == "\r\n" {
-			break
-		}
+	// Read client headers
+	headers := readClientHeaders(reader)
+	if headers == nil {
+		return
 	}
-	
+	// Check cache
+	cachedEntry, hasCache := state.GetFromCache(url)
+
 	// Connect to server
-	serverConn, err := net.Dial("tcp", host)
+	serverConn, err := net.Dial("tcp", address)
 	if err != nil {
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 	defer serverConn.Close()
+	// Send request to server
+	sendRequestToServer(serverConn, method, path, headers, cachedEntry, hasCache)
+	log.Printf("  → request to %s", address)
+	// Forward request body (async)
+	go io.Copy(serverConn, reader)
+	// Read response status
+	serverReader := bufio.NewReader(serverConn)
+	statusCode, statusLine := readResponseStatus(serverReader)
+	if statusLine == "" {
+		return
+	}
 
-	// Send request line
+	// Handle response
+	if hasCache && statusCode == 304 {
+		log.Printf("CACHE HIT: %s", url)
+		logRequest(method, url, "Cached", clientConn)
+		sendCachedResponse(clientConn, cachedEntry)
+		return
+	}
+	logRequest(method, url, "Allowed", clientConn)
+	streamAndCacheResponse(clientConn, serverReader, statusLine, url)
+}
+
+// readClientHeaders reads all headers until empty line
+func readClientHeaders(reader *bufio.Reader) []string {
+	var headers []string
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return nil
+		}
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			break
+		}
+		headers = append(headers, trimmed)
+	}
+	return headers
+}
+
+// sendRequestToServer sends the HTTP request with appropriate headers
+func sendRequestToServer(serverConn net.Conn, method, path string, headers []string, cachedEntry CacheEntry, hasCache bool) {
+	// Request line
 	fmt.Fprintf(serverConn, "%s %s HTTP/1.1\r\n", method, path)
 
-	// Forward headers
+	// Forward filtered headers
 	for _, header := range headers {
-		// strip proxy-related headers eg. Proxy-Authorization
-		if strings.HasPrefix(strings.ToLower(header), "proxy-") {
+		if shouldSkipHeader(header) {
 			continue
 		}
 		fmt.Fprintf(serverConn, "%s\r\n", header)
 	}
+	// Force connection close
+	fmt.Fprintf(serverConn, "Connection: close\r\n")
+	// Add conditional headers if cached
+	if hasCache {
+		if lastMod := cachedEntry.Header.Get("Last-Modified"); lastMod != "" {
+			fmt.Fprintf(serverConn, "If-Modified-Since: %s\r\n", lastMod)
+		}
+		if etag := cachedEntry.Header.Get("ETag"); etag != "" {
+			fmt.Fprintf(serverConn, "If-None-Match: %s\r\n", etag)
+		}
+	}
+	// End headers
 	fmt.Fprintf(serverConn, "\r\n")
-	log.Printf("  → request to %s", host)
-	// Force close connection after response
-	fmt.Fprintf(serverConn, "Connection: close\r\n") 
-    fmt.Fprintf(serverConn, "\r\n")
-	// Forward body (if any) and get response
-	go io.Copy(serverConn, reader)
-	io.Copy(clientConn, serverConn)
 }
 
+// shouldSkipHeader returns true for headers that shouldn't be forwarded
+func shouldSkipHeader(header string) bool {
+	lower := strings.ToLower(header)
+	skipPrefixes := []string{
+		"proxy-",
+		"connection:",
+		"if-modified-since:",
+		"if-none-match:",
+	}
+	for _, prefix := range skipPrefixes {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// readResponseStatus reads status line and returns code
+func readResponseStatus(reader *bufio.Reader) (int, string) {
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		return 0, ""
+	}
+
+	statusCode := 0
+	parts := strings.Fields(statusLine)
+	if len(parts) >= 2 {
+		statusCode, _ = strconv.Atoi(parts[1])
+	}
+
+	return statusCode, statusLine
+}
+
+// logRequest logs request to state
+func logRequest(method, url, status string, clientConn net.Conn) {
+	state.LogRequest(RequestLog{
+		Time:   time.Now(),
+		Method: method,
+		URL:    url,
+		Status: status,
+		SrcIP:  clientConn.RemoteAddr().String(),
+	})
+}
+
+func streamAndCacheResponse(clientConn net.Conn, reader *bufio.Reader, statusLine, url string) {
+	if _, err := clientConn.Write([]byte(statusLine)); err != nil {
+		return
+	}
+
+	// Read, Forward, and Parse Headers
+	headers := make(http.Header)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		if _, err := clientConn.Write([]byte(line)); err != nil {
+			return
+		}
+		if strings.TrimSpace(line) == "" {
+			break
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			lowerKey := strings.ToLower(key)
+			if lowerKey == "connection" || lowerKey == "keep-alive" || lowerKey == "proxy-connection" || lowerKey == "te" || lowerKey == "upgrade" {
+				continue
+			}
+			headers.Add(key, val)
+		}
+	}
+
+	// TeeReader duplicates the stream:
+	// - Reads from 'reader' (server)
+	// - Writes to 'bodyBuf' (cache)
+	// - Returns data to io.Copy for 'clientConn' (user)
+	var bodyBuf bytes.Buffer
+	io.Copy(clientConn, io.TeeReader(reader, &bodyBuf))
+
+	state.AddToCache(url, CacheEntry{
+		Header: headers,
+		Body:   bodyBuf.Bytes(),
+	})
+}
+
+func sendCachedResponse(clientConn net.Conn, entry CacheEntry) {
+	// Send status line
+	clientConn.Write([]byte("HTTP/1.1 200 OK\r\n"))
+	// Explicitly set Connection to close (since we don't support keep-alive in proxy perfectly yet)
+	fmt.Fprintf(clientConn, "Connection: close\r\n")
+	// Send headers
+	for key, values := range entry.Header {
+		if strings.ToLower(key) == "connection" {
+			continue
+		}
+		for _, value := range values {
+			fmt.Fprintf(clientConn, "%s: %s\r\n", key, value)
+		}
+	}
+	clientConn.Write([]byte("\r\n"))
+	// Send body
+	clientConn.Write(entry.Body)
+}
 
 // parseURL extracts host, port, and path from a URL
 // Examples:
-//   "http://example.com/page"      → host="example.com", port="80", path="/page"
-//   "http://example.com:8080/page" → host="example.com", port="8080", path="/page"
-//   "example.com:443"              → host="example.com", port="443", path=""
-//   "https://example.com/page"     → host="example.com", port="443", path="/page"
+//
+//	"http://example.com/page"      → host="example.com", port="80", path="/page"
+//	"http://example.com:8080/page" → host="example.com", port="8080", path="/page"
+//	"example.com:443"              → host="example.com", port="443", path=""
+//	"https://example.com/page"     → host="example.com", port="443", path="/page"
 func parseURL(url string) (host, port, path string) {
-	
+
 	// 1. Handle Scheme and Defaults
 	if strings.HasPrefix(url, "http://") {
 		port = "80"
@@ -200,7 +317,6 @@ func parseURL(url string) (host, port, path string) {
 		// Case: "example.com:443" (CONNECT method)
 		port = "443"
 	}
-
 	// 2. Separate Path
 	// If a slash exists, split it. This handles full URLs that were stripped above.
 	path = "/"
@@ -208,12 +324,10 @@ func parseURL(url string) (host, port, path string) {
 		path = url[idx:]
 		url = url[:idx]
 	}
-
 	// 3. Strip Authentication (user:pass@host)
 	if idx := strings.LastIndex(url, "@"); idx != -1 {
 		url = url[idx+1:]
 	}
-
 	// 4. Separate Host and Port (IPv6 Safe)
 	colonIdx := strings.LastIndex(url, ":")
 	bracketIdx := strings.LastIndex(url, "]")

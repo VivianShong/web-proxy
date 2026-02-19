@@ -1,25 +1,41 @@
-┌──────────┐         ┌─────────────────────────────────────┐         ┌──────────┐
-│  Browser │         │            PROXY SERVER             │         │  Origin  │
-│          │         │                                     │         │  Server  │
-└────┬─────┘         │  ┌─────────┐  ┌───────┐  ┌───────┐  │         └────┬─────┘
-     │               │  │Blocklist│  │ Cache │  │ Stats │  │              │
-     │   REQUEST     │  └────┬────┘  └───┬───┘  └───┬───┘  │              │
-     │───────────────┼──────►│           │          │      │              │
-     │               │       ▼           │          │      │              │
-     │               │   Blocked? ───YES─┼──► 403   │      │              │
-     │               │       │ NO        │          │      │              │
-     │               │       ▼           │          │      │              │
-     │               │   In cache? ──YES─┼──► Return│      │              │
-     │               │       │ NO        │   cached │      │              │
-     │               │       ▼           │          │      │   REQUEST    │
-     │               │   Forward ────────┼──────────┼──────┼─────────────►│
-     │               │                   │          │      │              │
-     │               │                   │          │      │   RESPONSE   │
-     │               │   Store in ◄──────┼──────────┼──────┼──────────────│
-     │   RESPONSE    │   cache           │          │      │              │
-     │◄──────────────┼───────────────────┘          │      │              │
-     │               │                              │      │              │
-     │               └──────────────────────────────┴──────┘              │
+```
+ Browser          Proxy Server              Origin Server
+    │                   │                          │
+    │── Request ───────►│                          │
+    │                   │                          │
+    │                   ├─ Blocked? ─YES──► 403 ──►│ (close)
+    │                   │       NO                 │
+    │                   │                          │
+    │            ┌──────┴──────┐                   │
+    │         CONNECT?        GET/POST             │
+    │            │              │                  │
+    │          YES              ▼                  │
+    │            │        In cache?                │
+    │            │         │       │               │
+    │            │        YES      NO              │
+    │            │         │       │               │
+    │            │         │       └── Request ───►│
+    │            │         │       ┌── 200 + body ─┤
+    │            │         │       │  (store body  │
+    │            │         │       │   in cache    │
+    │            │         │       │   via Tee)    │
+    │            │         │       │               │
+    │            │         └─ GET + If-Modified ──►│
+    │            │                  Since          │
+    │            │           ┌── 304 (no body) ────┤
+    │            │           │  (serve body        │
+    │            │           │   from memory)      │
+    │            │           │                     │
+    │◄── 200 ────┤◄──────────┘                     │
+    │            │                                 │
+    │         200 Tunnel                           │
+    │         Established                          │
+    │◄───────────┤                                 │
+    │            ├─────── TCP tunnel ──────────────┤
+    │═══ TLS ════╪════════════════════════════════►│
+    │◄══ TLS ════╪════════════════════════════════ │
+```
+
 The program should be able to:
 1. Respond to HTTP & HTTPS requests and should display each request on a management
 console. It should forward the request to the Web server and relay the response to the browser.
