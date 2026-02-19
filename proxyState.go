@@ -102,19 +102,25 @@ func (s *ProxyState) IsBlocked(host string) bool {
 	return false
 }
 
-// AddToCache adds a response to the cache
+// AddToCache adds a response to the cache, stamping the current time as CachedAt.
 func (s *ProxyState) AddToCache(key string, resp CacheEntry) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	resp.CachedAt = time.Now()
 	s.Cache.entries[key] = resp
 }
 
-// GetFromCache retrieves a response from the cache
+// GetFromCache retrieves a response from the cache.
+// Returns (entry, true) only when the entry exists AND is within the TTL.
+// A stale entry is treated as a miss so the proxy re-fetches from the origin.
 func (s *ProxyState) GetFromCache(key string) (CacheEntry, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	entry, exists := s.Cache.entries[key]
-    return entry, exists
+	if !exists || !entry.Fresh() {
+		return CacheEntry{}, false
+	}
+	return entry, true
 }
 
 // LogRequest adds a request log
