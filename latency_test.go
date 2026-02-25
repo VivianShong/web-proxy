@@ -580,6 +580,167 @@ func TestCacheEviction(t *testing.T) {
 	})
 }
 
+// TestConditionalGETBandwidth measures the bandwidth cost of the 304 path.
+//
+// When the TTL expires and the origin supports If-Modified-Since, the proxy
+// sends a conditional GET. If the content is unchanged, the origin replies
+// with 304 and no body — saving the full body transfer while still paying
+// one RTT.
+//
+// Sequence:
+//
+//	Request 1 (miss)       — full fetch, origin bytes = bodySize
+//	Request 2 (TTL hit)    — served from memory, origin bytes = 0
+//	[expire cache]
+//	Request 3 (304 revalidation) — origin sends headers only (no body), proxy
+//	                               resets TTL and serves from cache
+//	Request 4 (TTL hit)    — served from memory again, origin bytes = 0
+func TestConditionalGETBandwidth(t *testing.T) {
+	const bodySize = 100 * 1024
+	body := strings.Repeat("c", bodySize)
+	lastModified := "Mon, 01 Jan 2024 00:00:00 GMT"
+
+	var requestCount atomic.Int32
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.Header().Set("Last-Modified", lastModified)
+		if r.Header.Get("If-Modified-Since") == lastModified {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, body)
+	})
+
+	origin, counter := newCountingServer(handler)
+	defer origin.Close()
+
+	proxyAddr, stop := startProxy(t)
+	defer stop()
+
+	targetURL := "http://" + origin.Listener.Addr().String() + "/conditional"
+
+	// Request 1: miss — full body fetched and cached.
+	counter.written.Store(0)
+	proxyRequest(t, proxyAddr, targetURL)
+	missBytes := int(counter.written.Load())
+	t.Logf("Request 1 (miss):         origin bytes = %6d", missBytes)
+
+	// Request 2: fresh TTL hit — origin not contacted.
+	counter.written.Store(0)
+	proxyRequest(t, proxyAddr, targetURL)
+	hitBytes := int(counter.written.Load())
+	t.Logf("Request 2 (TTL hit):      origin bytes = %6d", hitBytes)
+	if hitBytes != 0 {
+		t.Errorf("request 2: expected 0 origin bytes, got %d", hitBytes)
+	}
+
+	// Expire the cache entry.
+	state.mu.Lock()
+	if e, ok := state.Cache.entries[targetURL]; ok {
+		e.CachedAt = e.CachedAt.Add(-cacheTTL - time.Second)
+		state.Cache.entries[targetURL] = e
+	}
+	state.mu.Unlock()
+
+	// Request 3: stale — conditional GET → 304, no body from origin.
+	counter.written.Store(0)
+	_, clientBytes3 := proxyRequest(t, proxyAddr, targetURL)
+	revalBytes := int(counter.written.Load())
+	t.Logf("Request 3 (304 reval):    origin bytes = %6d  client bytes = %d", revalBytes, clientBytes3)
+
+	if revalBytes >= bodySize {
+		t.Errorf("request 3: origin sent %d bytes on 304 path, expected much less (headers only)", revalBytes)
+	}
+	// Client must still receive the full cached body.
+	if clientBytes3 < bodySize {
+		t.Errorf("request 3: client received only %d bytes, want >= %d", clientBytes3, bodySize)
+	}
+
+	// Request 4: TTL reset by revalidation — fresh hit again.
+	counter.written.Store(0)
+	proxyRequest(t, proxyAddr, targetURL)
+	postRevalBytes := int(counter.written.Load())
+	t.Logf("Request 4 (TTL hit):      origin bytes = %6d", postRevalBytes)
+	if postRevalBytes != 0 {
+		t.Errorf("request 4: expected 0 origin bytes after TTL reset, got %d", postRevalBytes)
+	}
+
+	// Origin hit: request 1 (miss) + request 3 (304 reval) = 2. Request 2 and 4 bypass origin.
+	if got := int(requestCount.Load()); got != 2 {
+		t.Errorf("origin hit %d times, want 2 (initial miss + 304 revalidation)", got)
+	}
+
+	saving304 := 100 * float64(missBytes-revalBytes) / float64(missBytes)
+	t.Logf("Bandwidth summary:")
+	t.Logf("  Cache miss          : %d bytes (full body)", missBytes)
+	t.Logf("  TTL hit             : 0 bytes  (memory)")
+	t.Logf("  304 revalidation    : %d bytes  (headers only, %.1f%% saving vs miss)", revalBytes, saving304)
+	t.Logf("  Post-reval TTL hit  : 0 bytes  (TTL reset)")
+}
+
+// TestConditionalGETLatency measures the latency of each cache path with a
+// simulated origin delay, showing the cost difference between a fresh TTL hit
+// (0 RTT), a 304 revalidation (1 RTT, no body), and a full miss (1 RTT + body).
+func TestConditionalGETLatency(t *testing.T) {
+	const originDelay = 50 * time.Millisecond
+	lastModified := "Mon, 01 Jan 2024 00:00:00 GMT"
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(originDelay)
+		w.Header().Set("Last-Modified", lastModified)
+		if r.Header.Get("If-Modified-Since") == lastModified {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		fmt.Fprint(w, strings.Repeat("x", 4096))
+	})
+
+	origin := httptest.NewServer(handler)
+	defer origin.Close()
+
+	proxyAddr, stop := startProxy(t)
+	defer stop()
+
+	targetURL := "http://" + origin.Listener.Addr().String() + "/latency-cond"
+
+	// Miss: one full RTT + body.
+	missLatency := proxyRequestTimed(t, proxyAddr, targetURL)
+	t.Logf("Cache miss latency       : %v", missLatency.Round(time.Millisecond))
+
+	// Fresh TTL hit: memory only, zero RTT.
+	hitLatency := proxyRequestTimed(t, proxyAddr, targetURL)
+	t.Logf("TTL hit latency          : %v", hitLatency.Round(time.Millisecond))
+
+	// Expire the cache.
+	state.mu.Lock()
+	if e, ok := state.Cache.entries[targetURL]; ok {
+		e.CachedAt = e.CachedAt.Add(-cacheTTL - time.Second)
+		state.Cache.entries[targetURL] = e
+	}
+	state.mu.Unlock()
+
+	// 304 revalidation: one RTT (no body transfer).
+	revalLatency := proxyRequestTimed(t, proxyAddr, targetURL)
+	t.Logf("304 revalidation latency : %v", revalLatency.Round(time.Millisecond))
+
+	t.Logf("Latency summary (origin delay = %v):", originDelay)
+	t.Logf("  Miss    : %v  (1 RTT + body)", missLatency.Round(time.Millisecond))
+	t.Logf("  TTL hit : %v  (0 RTT, memory)", hitLatency.Round(time.Millisecond))
+	t.Logf("  304     : %v  (1 RTT, no body) — %.1fx faster than miss",
+		revalLatency.Round(time.Millisecond),
+		float64(missLatency)/float64(revalLatency))
+
+	// TTL hit must be faster than 304 (304 still pays one RTT).
+	if hitLatency >= revalLatency {
+		t.Errorf("TTL hit %v should be faster than 304 reval %v", hitLatency, revalLatency)
+	}
+	// 304 must be faster than or equal to miss (no body on 304).
+	if revalLatency > missLatency+5*time.Millisecond {
+		t.Errorf("304 reval %v should not be slower than miss %v", revalLatency, missLatency)
+	}
+}
+
 // BenchmarkUncachedHTTP measures bytes-per-operation for cache-miss requests.
 func BenchmarkUncachedHTTP(b *testing.B) {
 	state = NewProxyState()

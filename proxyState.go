@@ -113,12 +113,25 @@ func (s *ProxyState) AddToCache(key string, resp CacheEntry) {
 
 // GetFromCache retrieves a response from the cache.
 // Returns (entry, true) only when the entry exists AND is within the TTL.
-// A stale entry is treated as a miss so the proxy re-fetches from the origin.
 func (s *ProxyState) GetFromCache(key string) (CacheEntry, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	entry, exists := s.Cache.entries[key]
 	if !exists || !entry.Fresh() {
+		return CacheEntry{}, false
+	}
+	return entry, true
+}
+
+// GetStaleFromCache returns a cache entry that exists but has expired.
+// Used to supply conditional GET headers (If-Modified-Since / If-None-Match)
+// when the TTL has lapsed, avoiding a full re-fetch when content is unchanged.
+// Returns (entry, true) only when the entry exists AND is stale.
+func (s *ProxyState) GetStaleFromCache(key string) (CacheEntry, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	entry, exists := s.Cache.entries[key]
+	if !exists || entry.Fresh() {
 		return CacheEntry{}, false
 	}
 	return entry, true
