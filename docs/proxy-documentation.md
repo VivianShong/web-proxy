@@ -39,7 +39,7 @@ A single `ProxyState` singleton (protected by a `sync.RWMutex`) is shared betwee
                      │        │
           CONNECT    │        │  GET/POST/...
                      │        │
-         ┌───────────▼──┐  ┌──▼──────────────┐
+         ┌───────────▼──┐  ┌──▼───────────────┐
          │ handleHTTPS  │  │  handleHTTP      │
          │ (TLS tunnel) │  │  (HTTP + cache)  │
          └───────┬──────┘  └────────┬─────────┘
@@ -1107,35 +1107,46 @@ func StartManagementServer(addr string, state *ProxyState) {
 | **`Connection: close` forced upstream** | Eliminates the need to parse `Content-Length` or `Transfer-Encoding: chunked` to know when the response body ends — we read until EOF. |
 | **CONNECT tunnel (no TLS interception)** | Preserves end-to-end TLS security. No custom certificate authority required. HTTPS content is not visible to the proxy. |
 | **Subdomain blocking via suffix match** | A single blocked entry covers the apex domain and all of its subdomains, which is the common administrator expectation. |
+| **TTL cache + conditional GET on expiry** | Within the TTL window the origin is never contacted (zero bandwidth, ~500× latency improvement). After expiry a conditional GET (`If-Modified-Since` / `If-None-Match`) lets the origin return a cheap 304 instead of resending the full body when content is unchanged — 99.9% bandwidth saving on revalidation. If the content changed, a normal 200 response replaces the cache entry. |
+| **Kill active HTTPS tunnels on block** | When a domain is added to the block list, all open `CONNECT` tunnels to that domain are closed immediately. Without this, a browser that already established a tunnel can continue sending HTTPS requests through it even after the block is applied, because the blocking check only runs at the start of `handleConnection`. Closing the `net.Conn` breaks the `io.Copy` loop instantly, forcing the browser to reconnect — at which point the block check fires and returns 403. |
 | **JSON persistence for blocked hosts** | Simple, human-readable format. The block list survives proxy restarts without a database. |
 | **No external dependencies** | The entire proxy is built on the Go standard library, making it easy to compile and deploy (`go build`). |
 
 ---
 
-## 9. Cache Strategy: Why Conditional GET Instead of a Pure Local Cache
+## 9. Cache Strategy: TTL + Conditional GET
 
-### 9.1 The Two Options
+### 9.1 Design
 
-A caching proxy can take two approaches when it already holds a copy of a resource:
+The proxy combines a **TTL (time-to-live) cache** with **conditional GET revalidation** to give three distinct behaviours depending on the age of the cached entry. Constants in [cache.go](../cache.go) control the policy:
 
-**Option A — Pure local cache (serve directly, never contact the origin):**
-The proxy stores the response and serves it from memory for all future requests, never asking the origin server again. This eliminates every origin round-trip after the first fetch.
+```go
+const cacheTTL       = 5 * time.Minute
+const cacheMaxEntries = 100
+```
 
-**Option B — Conditional GET (validate freshness with the origin each time):**
-The proxy holds the cached body but contacts the origin on every request, sending `If-Modified-Since` or `If-None-Match`. The origin replies with either `304 Not Modified` (no body — proxy serves from memory) or `200 OK` with a fresh body (proxy updates the cache).
+`handleHTTP` in [main.go](../main.go) implements the three-way lookup:
 
-### 9.2 Why This Proxy Uses Conditional GET
+```go
+// Case 1 — Fresh hit (within TTL): serve from memory, no origin contact.
+// Case 2 — Stale hit (TTL expired): conditional GET to origin.
+//           304 Not Modified → reset TTL, serve from cache.
+//           200 OK           → stream new body, replace cache entry.
+// Case 3 — Miss (never seen): full unconditional GET, cache the response.
+```
 
-This proxy uses **Option B** deliberately. The key reason is **correctness for dynamic content**: web pages and APIs change. A pure local cache would serve stale HTML, outdated API responses, or old images to the browser with no way of knowing the content had changed on the server. The browser would see yesterday's version of a page even though the site was updated this morning.
+| Case | Condition | Origin contacted? | Body transferred? | TTL reset? |
+|------|-----------|-------------------|-------------------|------------|
+| **Fresh hit** | Entry exists, `Fresh()` = true | No | No | No (still valid) |
+| **304 revalidation** | Entry exists, `Fresh()` = false, origin returns 304 | Yes (headers only) | No | Yes |
+| **200 re-fetch** | Entry exists, `Fresh()` = false, origin returns 200 | Yes (full response) | Yes | Yes |
+| **Miss** | No entry | Yes (full response) | Yes | N/A |
 
-Conditional GET solves this by letting the **origin server be the authority on freshness**. The proxy sends its cached timestamp (`If-Modified-Since`) and the server decides:
+`GetFromCache` returns a fresh entry; `GetStaleFromCache` returns an expired entry so `handleHTTP` can use its `Last-Modified` / `ETag` headers to build the conditional request. On a 304 response, `AddToCache` is called with the same entry to re-stamp `CachedAt`, resetting the TTL without refetching the body.
 
-- If nothing changed → `304`, no bytes wasted, proxy serves the cached body.
-- If the content changed → `200` with the new body, cache is updated automatically.
+**Size limit:** before every insert, `evict()` ensures the map never exceeds 100 entries (expired entries purged first, then the oldest fresh entry).
 
-This means the proxy always delivers current content while still saving bandwidth whenever the content hasn't changed.
-
-### 9.3 Bandwidth Savings Measured
+### 9.2 Bandwidth Savings Measured
 
 The following results were produced by `TestBandwidthSummary` and `TestBandwidthSavedOnCacheHit` in [latency_test.go](../latency_test.go). Each test starts a real HTTP origin server, sends the same URL through the proxy twice, and counts the bytes the origin actually transmitted.
 
@@ -1143,25 +1154,129 @@ The following results were produced by `TestBandwidthSummary` and `TestBandwidth
 
 | Body Size | Cache Miss (request 1) | Cache Hit (request 2) | Bytes Saved | Saving |
 |-----------|----------------------|----------------------|-------------|--------|
-| 10 KB     | 10,443 B             | 85 B                 | 10,358 B    | 99.2%  |
-| 100 KB    | 102,604 B            | 85 B                 | 102,519 B   | 99.9%  |
-| 500 KB    | 512,204 B            | 85 B                 | 512,119 B   | 100.0% |
+| 10 KB     | 10,443 B             | 0 B                  | 10,443 B    | 100.0% |
+| 100 KB    | 102,604 B            | 0 B                  | 102,604 B   | 100.0% |
+| 500 KB    | 512,204 B            | 0 B                  | 512,204 B   | 100.0% |
 
-The **85 bytes** on a cache hit is purely the `HTTP/1.1 304 Not Modified` response header line plus a handful of headers — no body is sent at all. The proxy reconstructs and delivers the full original body to the browser entirely from memory.
+On a TTL cache hit, **zero bytes** travel from the origin to the proxy. The proxy serves the entire body from in-process memory.
 
-`TestBandwidthSavedAcrossMultipleRequests` confirms this holds for repeated requests: requests 2 through 6 for the same URL each cost only 85 bytes from the origin, while the client receives the full 51,403-byte body every time.
+`TestBandwidthSavedAcrossMultipleRequests` confirms this holds for repeated requests: requests 2 through 6 for the same URL each cost 0 origin bytes, while the client receives the full 51,357-byte body every time.
 
-`TestNoBandwidthSavingWithoutLastModified` validates the negative case: when the origin does not include a `Last-Modified` header, the proxy has no validator to send and must re-fetch the full body on every request.
+`TestCacheExpiry` verifies the expiry path: after backdating `CachedAt` past the TTL, the next request re-fetches the full body from the origin.
 
-### 9.4 What Conditional GET Does Not Save
+### 9.3 Latency Improvement Measured
 
-Conditional GET eliminates body bandwidth but does **not** eliminate the origin round-trip. Every cached request still opens a TCP connection to the origin and waits for the `304` response. This is intentional — it is the trade-off for always having up-to-date content. A pure local cache with a TTL would save that RTT but would serve stale content until the TTL expires.
+Because the TTL cache eliminates the origin round-trip entirely, cached requests are dramatically faster. Results from `TestCachedLatencyFasterThanUncached` and `TestLatencySummary` in [latency_test.go](../latency_test.go):
+
+| Simulated Origin Delay | Cache Miss | TTL Hit (avg) | Time Saved | Speedup |
+|------------------------|-----------|---------------|------------|---------|
+| 10 ms                  | 12 ms     | <1 ms         | 11 ms      | ~75×    |
+| 50 ms                  | 51 ms     | <1 ms         | 51 ms      | ~489×   |
+| 100 ms                 | 102 ms    | <1 ms         | 101 ms     | ~958×   |
+
+The sub-millisecond cache hit time is the cost of a memory lookup and a TCP write to the browser — no DNS, no TCP connect, no origin processing time.
+
+`TestConditionalGETLatency` adds the 304 revalidation path (50 ms origin delay):
+
+| Path | Latency | Note |
+|------|---------|------|
+| Cache miss | 51 ms | 1 RTT + body |
+| TTL hit | <1 ms | 0 RTT, served from memory |
+| 304 revalidation | 52 ms | 1 RTT, no body transmitted |
+
+The 304 path costs the same RTT as a miss because the origin still processes the request — but it avoids transmitting the body. For large resources (images, scripts) this is a significant bandwidth saving at no extra latency cost.
+
+### 9.4 Expired TTL: Conditional GET Revalidation
+
+When the TTL elapses the proxy does not immediately discard the entry. Instead it performs a **conditional GET**, attaching `If-Modified-Since` (and `If-None-Match` if an ETag was present) from the stale entry's headers. The origin can then reply cheaply with `304 Not Modified` instead of resending the full body.
+
+#### Case A — TTL expired, data unchanged (304 path)
+
+`TestConditionalGETBandwidth` measures this with a 100 KB body:
+
+| Step | Origin Bytes | Client Bytes | Note |
+|------|-------------|-------------|------|
+| Request 1 — cache miss | 102,589 B | 102,589 B | Full fetch; entry stored with `Last-Modified` |
+| Request 2 — TTL hit | 0 B | 102,589 B | Served from memory |
+| Request 3 — 304 revalidation | **131 B** | 102,589 B | Headers only; body served from cache |
+| Request 4 — TTL hit | 0 B | 102,589 B | TTL reset by revalidation |
+
+The 131 bytes on request 3 are HTTP response headers only — **99.9% bandwidth saving** compared to a full re-fetch. The client still receives the complete 102,589-byte body, served from the in-memory cache. `AddToCache` is called with the same entry to re-stamp `CachedAt`, resetting the TTL without refetching the body.
+
+#### Case B — TTL expired, data modified (200 path)
+
+If the origin content has changed it returns `200 OK` with a new body. The proxy streams and caches the new body exactly as on a fresh miss. `TestExpiredTTLModifiedData` confirms correctness:
+
+| Step | Origin Bytes | Content | Note |
+|------|-------------|---------|------|
+| Request 1 — cache miss | 51,342 B | v1 | Initial fetch of v1 |
+| Request 2 — TTL hit | 0 B | v1 | Served from memory |
+| [origin updated to v2; cache expired] | | | |
+| Request 3 — conditional GET → 200 | 51,342 B | **v2** | Origin changed; full body received |
+| Request 4 — TTL hit | 0 B | v2 | v2 now cached |
+
+The proxy **never serves stale content beyond the TTL window**. After expiry it always contacts the origin — either getting a cheap 304 or the new content.
+
+#### Trade-off summary
+
+| Scenario | Origin bytes | Client bytes | Latency vs. no cache | Content freshness |
+|----------|-------------|-------------|---------------------|-------------------|
+| Within TTL | 0 B | full body | **~500× faster** (0 RTT) | At most 5 min stale |
+| Expired, unchanged (304) | ~131 B headers | full body (from cache) | ~1 RTT (same as miss) | Always current |
+| Expired, modified (200) | full body | full body | ~1 RTT + body | Always current |
+
+The key benefit of conditional GET over a plain re-fetch: when content is unchanged, **the body is never retransmitted** even though the origin is contacted.
+
+### 9.5 Cache Size Limit and Eviction
+
+Without a size bound the cache map would grow indefinitely, one entry per unique URL ever requested. Two constants in [cache.go](../cache.go) cap this:
+
+```go
+const cacheTTL       = 5 * time.Minute
+const cacheMaxEntries = 100
+```
+
+`AddToCache` calls `Cache.evict()` before every insert. `evict()` runs in two passes while the `ProxyState` write lock is already held:
+
+```go
+func (c *Cache) evict() {
+    // Pass 1: drop all expired entries (no value keeping them)
+    for k, e := range c.entries {
+        if !e.Fresh() {
+            delete(c.entries, k)
+        }
+    }
+    if len(c.entries) < cacheMaxEntries {
+        return
+    }
+    // Pass 2: still at limit — remove the single oldest fresh entry
+    var oldestKey string
+    var oldestTime time.Time
+    for k, e := range c.entries {
+        if oldestKey == "" || e.CachedAt.Before(oldestTime) {
+            oldestKey = k
+            oldestTime = e.CachedAt
+        }
+    }
+    if oldestKey != "" {
+        delete(c.entries, oldestKey)
+    }
+}
+```
+
+**Eviction priority:**
+1. All expired entries are deleted first — they carry no useful data.
+2. Only if the cache is still full after purging expired entries is a fresh entry removed, choosing the one with the earliest `CachedAt` (the least-recently-added entry).
+
+`TestCacheEviction` in [latency_test.go](../latency_test.go) verifies both properties:
+
+- **Sub-test 1 — oldest fresh entry at limit**: fills the cache to 100, backdates each entry so `url/0` is oldest. Adding entry 101 evicts `url/0` and holds the size at 100.
+- **Sub-test 2 — expired before fresh**: fills with 99 fresh entries plus 1 expired entry. Adding a new entry evicts only the expired one; all 99 fresh entries are preserved.
 
 ---
 
 ## 10. Limitations
 
-- **Cache has no expiry or size limit.** The cache grows without bound and never evicts stale entries. A production proxy would implement LRU eviction and respect `Cache-Control` / `Expires` headers.
 - **No HTTP keep-alive to the origin.** Every HTTP request opens a new TCP connection to the origin server. This increases latency and load on the origin for pages with many sub-resources.
 - **Caching is HTTP-only.** HTTPS responses are never cached because the proxy cannot read the encrypted content.
 - **Cache key is the raw URL string.** There is no normalisation (e.g., query-parameter ordering), so `?a=1&b=2` and `?b=2&a=1` are stored as two separate entries.

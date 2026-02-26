@@ -114,35 +114,53 @@ func handleHTTP(clientConn net.Conn, reader *bufio.Reader, method, url string) {
 	if headers == nil {
 		return
 	}
-	// Check cache
-	cachedEntry, hasCache := state.GetFromCache(url)
+	// ── Cache lookup: three cases ─────────────────────────────────────────
+	//
+	// Case 1 — Fresh hit (within TTL): serve from memory, no origin contact.
+	// Case 2 — Stale hit (TTL expired): conditional GET to origin.
+	//           304 Not Modified → reset TTL, serve from cache.
+	//           200 OK           → stream new body, replace cache entry.
+	// Case 3 — Miss (never seen):  full unconditional GET, cache the response.
 
-	// Connect to server
+	if cachedEntry, fresh := state.GetFromCache(url); fresh {
+		// Case 1: fresh TTL hit
+		log.Printf("CACHE HIT (TTL): %s", url)
+		logRequest(method, url, "Cached", clientConn)
+		sendCachedResponse(clientConn, cachedEntry)
+		return
+	}
+
+	staleEntry, isStale := state.GetStaleFromCache(url)
+
 	serverConn, err := net.Dial("tcp", address)
 	if err != nil {
 		clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 		return
 	}
 	defer serverConn.Close()
-	// Send request to server
-	sendRequestToServer(serverConn, method, path, headers, cachedEntry, hasCache)
+
+	// Send request — conditional if we have a stale entry, plain GET otherwise.
+	sendRequestToServer(serverConn, method, path, headers, staleEntry, isStale)
 	log.Printf("  → request to %s", address)
-	// Forward request body (async)
+
 	go io.Copy(serverConn, reader)
-	// Read response status
+
 	serverReader := bufio.NewReader(serverConn)
 	statusCode, statusLine := readResponseStatus(serverReader)
-	if statusLine == "" {
+	if statusLine == "" || statusCode == 0 {
 		return
 	}
 
-	// Handle response
-	if hasCache && statusCode == 304 {
-		log.Printf("CACHE HIT: %s", url)
+	if statusCode == http.StatusNotModified {
+		// Case 2a: 304 — content unchanged, reset TTL and serve from cache.
+		log.Printf("CACHE REVALIDATED (304): %s", url)
 		logRequest(method, url, "Cached", clientConn)
-		sendCachedResponse(clientConn, cachedEntry)
+		state.AddToCache(url, staleEntry) // re-stamps CachedAt, resets TTL
+		sendCachedResponse(clientConn, staleEntry)
 		return
 	}
+
+	// Case 2b / Case 3: 200 or other — stream and cache the new response.
 	logRequest(method, url, "Allowed", clientConn)
 	streamAndCacheResponse(clientConn, serverReader, statusLine, url)
 }
